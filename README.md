@@ -21,7 +21,7 @@ python -m pip install -e ".[dev]"
 uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000/docs, or score an event:
+Open http://localhost:8000/docs, read the [API reference](docs/api.md), or score an event:
 
 ```bash
 curl -s http://localhost:8000/v1/score \
@@ -64,6 +64,7 @@ Or `docker compose up --build`.
 app/                     FastAPI app, request schemas and scoring rules
 tests/                   Unit and API contract tests
 docs/architecture.md     Architecture and diagrams
+ docs/api.md              API contract and scoring rules
 docs/paysim.md           Dataset schema, source and attribution
 docs/ml-plan.md          Temporal validation and leakage-safe feature plan
 docs/security.md         Security boundaries and deployment considerations
