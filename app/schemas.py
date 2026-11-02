@@ -1,11 +1,11 @@
 """API contracts for transaction risk scoring."""
 
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class TransactionType(str, Enum):
+class TransactionType(StrEnum):
     """Supported PaySim transaction categories."""
 
     CASH_IN = "CASH_IN"
