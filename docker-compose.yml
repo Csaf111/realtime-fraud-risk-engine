@@ -1,0 +1,18 @@
+services:
+  api:
+    build:
+      context: .
+      args:
+        VERSION: local
+    image: realtime-fraud-risk-engine:local
+    ports:
+      - "8000:8000"
+    environment:
+      FRE_ENVIRONMENT: local-compose
+      FRE_REVIEW_THRESHOLD: "0.5"
+      FRE_BLOCK_THRESHOLD: "0.8"
+      # Uncomment after training a model (make train-synthetic or make train):
+      # FRE_MODEL_PATH: /app/models/baseline.json
+    volumes:
+      - ./models:/app/models:ro
+    restart: unless-stopped

@@ -1,0 +1,12 @@
+{
+  "transaction_id": "demo-fraud-001",
+  "step": 1,
+  "type": "TRANSFER",
+  "amount": 250000.0,
+  "nameOrig": "C1305486145",
+  "oldbalanceOrg": 250000.0,
+  "newbalanceOrig": 0.0,
+  "nameDest": "C553264065",
+  "oldbalanceDest": 0.0,
+  "newbalanceDest": 0.0
+}

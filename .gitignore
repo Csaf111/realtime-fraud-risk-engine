@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Data: never commit PaySim or derived data (size + licence)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model artifacts are produced by training / CD, not committed
+models/*
+!models/.gitkeep
+!models/README.md
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+.env

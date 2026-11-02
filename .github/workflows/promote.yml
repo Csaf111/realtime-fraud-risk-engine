@@ -1,0 +1,38 @@
+name: Promote
+
+# Opens a promotion PR: v1 -> staging, or staging -> prod.
+# Requires: Settings -> Actions -> General -> "Allow GitHub Actions to create and approve
+# pull requests". Note that PRs opened with GITHUB_TOKEN don't trigger CI themselves;
+# the CD workflow still runs the full CI gate after the merge.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Environment branch to promote into
+        type: choice
+        options: [staging, prod]
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Open promotion PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [ "$TARGET" = "staging" ]; then SOURCE=v1; else SOURCE=staging; fi
+          existing=$(gh pr list --base "$TARGET" --head "$SOURCE" --state open --json url --jq '.[0].url')
+          if [ -n "$existing" ]; then
+            echo "Promotion PR already open: $existing"
+            exit 0
+          fi
+          gh pr create --base "$TARGET" --head "$SOURCE" \
+            --title "Promote ${SOURCE} -> ${TARGET}" \
+            --body "Automated promotion of \`${SOURCE}\` into \`${TARGET}\`. Merging triggers the CD pipeline for **${TARGET}**."

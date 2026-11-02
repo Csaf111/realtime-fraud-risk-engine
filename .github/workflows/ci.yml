@@ -1,0 +1,151 @@
+name: CI
+
+# Runs on every push to v1, every PR into v1/staging/prod, and is re-used as the quality
+# gate by the CD workflow (workflow_call) before anything is published or deployed.
+on:
+  push:
+    branches: [v1]
+  pull_request:
+    branches: [v1, staging, prod]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check . --output-format=github
+      - name: Ruff format check
+        run: ruff format --check .
+      - name: mypy
+        run: mypy
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - name: Unit + API tests with coverage gate
+        run: pytest --cov --cov-report=term-missing --cov-report=xml --junitxml=junit.xml
+      - name: Upload coverage report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            junit.xml
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    # Report-only so an upstream CVE disclosure doesn't block unrelated work.
+    # Make this blocking once you have a triage process.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit .
+      - run: pip-audit --strict --skip-editable
+
+  pipeline:
+    name: Training pipeline (synthetic)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[train]"
+      - name: Train baseline on synthetic PaySim-shaped data
+        run: python -m fraud_engine.train --synthetic 20000 --out models/baseline.json --version ci-${{ github.run_number }}
+      - name: Model loads and scores
+        run: |
+          FRE_MODEL_PATH=models/baseline.json python - <<'PY'
+          import json
+          from fraud_engine.config import Settings
+          from fraud_engine.scoring import RiskEngine
+          eng = RiskEngine(Settings.from_env())
+          r = eng.score(json.load(open("scripts/sample_fraud.json")))
+          print(r.model_dump_json(indent=2))
+          assert eng.mode == "rules+model" and r.decision.value == "BLOCK"
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-model
+          path: models/baseline*.json
+
+  docker:
+    name: Docker build & smoke test
+    runs-on: ubuntu-latest
+    needs: [test, pipeline]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: realtime-fraud-risk-engine:ci
+          build-args: |
+            VERSION=ci
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test (rules-only)
+        run: |
+          docker run -d --name fre -p 8000:8000 realtime-fraud-risk-engine:ci
+          ./scripts/smoke_test.sh http://localhost:8000
+          docker inspect --format '{{.Config.User}}' fre | grep -q app
+      - uses: actions/download-artifact@v4
+        with:
+          name: synthetic-model
+          path: ci-model
+      - name: Smoke test (rules + model)
+        run: |
+          docker run -d --name fre-model -p 8001:8000 \
+            -v "$PWD/ci-model:/app/models:ro" \
+            -e FRE_MODEL_PATH=/app/models/baseline.json \
+            realtime-fraud-risk-engine:ci
+          ./scripts/smoke_test.sh http://localhost:8001
+          curl -fsS http://localhost:8001/ready | grep -q '"rules+model"'
+      - name: Container logs
+        if: always()
+        run: |
+          docker logs fre || true
+          docker logs fre-model || true
