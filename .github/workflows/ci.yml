@@ -76,8 +76,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install pip-audit .
-      - run: pip-audit --strict --skip-editable
+      - name: Install runtime dependencies (not the project itself, it isn't on PyPI)
+        run: |
+          pip install pip-audit .
+          pip uninstall -y realtime-fraud-risk-engine
+      - run: pip-audit --strict
 
   pipeline:
     name: Training pipeline (synthetic)
