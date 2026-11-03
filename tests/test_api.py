@@ -93,3 +93,14 @@ def test_metrics_endpoint_counts_decisions(client):
 
 def test_openapi_available(client):
     assert client.get("/openapi.json").json()["info"]["title"] == "Realtime Fraud Risk Engine"
+
+
+def test_metrics_endpoint_exports_rule_hits_and_score_histogram(client):
+    fraud = client.post("/v1/score", json=fraud_txn()).json()
+    client.post("/v1/score/batch", json={"transactions": [make_txn(), fraud_txn()]})
+    text = client.get("/metrics").text
+    assert "fre_scored_total 3" in text
+    assert "fre_risk_score_count 3" in text
+    for hit in fraud["rule_hits"]:
+        assert f'fre_rule_hits_total{{rule="{hit["code"]}"}} 2' in text
+    assert 'fre_risk_score_bucket{le="+Inf"} 3' in text
