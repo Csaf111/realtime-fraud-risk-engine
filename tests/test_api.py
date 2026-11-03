@@ -104,3 +104,11 @@ def test_metrics_endpoint_exports_rule_hits_and_score_histogram(client):
     for hit in fraud["rule_hits"]:
         assert f'fre_rule_hits_total{{rule="{hit["code"]}"}} 2' in text
     assert 'fre_risk_score_bucket{le="+Inf"} 3' in text
+
+
+def test_nonfinite_transaction_values_rejected(client):
+    """NaN and infinities must not enter risk calculations or JSON responses."""
+    for field in ("amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest"):
+        for invalid in ("NaN", "Infinity", "-Infinity"):
+            response = client.post("/v1/score", json=make_txn(**{field: invalid}))
+            assert response.status_code == 422, (field, invalid, response.text)
