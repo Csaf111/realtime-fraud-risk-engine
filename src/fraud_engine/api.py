@@ -22,6 +22,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("fraud_engine.api")
 
 
+def _observe(m: Metrics, result: RiskResult) -> None:
+    m.observe(
+        result.decision.value,
+        result.latency_ms,
+        risk_score=result.risk_score,
+        rule_codes=[h.code for h in result.rule_hits],
+    )
+
+
 def create_app(settings: Settings | None = None, engine: RiskEngine | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
@@ -74,7 +83,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         m: Metrics = request.app.state.metrics
         m.request("score")
         result = eng.score(txn)
-        m.observe(result.decision.value, result.latency_ms)
+        _observe(m, result)
         return result
 
     @app.post("/v1/score/batch", response_model=BatchResponse, tags=["scoring"])
@@ -91,7 +100,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         results = []
         for t in batch.transactions:
             r = eng.score(t, update_state=batch.update_state)
-            m.observe(r.decision.value, r.latency_ms)
+            _observe(m, r)
             results.append(r)
         return BatchResponse(results=results, count=len(results))
 
