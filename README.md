@@ -72,9 +72,25 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 | `GET` | `/v1/rules` | The rulebook (code, description, points) |
 | `GET` | `/health` | Liveness |
 | `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version |
-| `GET` | `/metrics` | Prometheus-format counters and latency histogram |
+| `GET` | `/metrics` | Prometheus-format counters, latency histogram, per-rule hits, score histogram |
 
 Every response carries an `x-request-id` header. The API echoes yours or generates one.
+
+### Monitoring metrics
+
+`/metrics` exports, alongside request/decision counts and scoring latency:
+
+| Metric | Type | Use |
+|---|---|---|
+| `fre_scored_total` | counter | Transactions scored (denominator for hit rates) |
+| `fre_rule_hits_total{rule="R00x"}` | counter | Times each rule fired |
+| `fre_risk_score` | histogram (0.1 … 1.0) | Distribution of final risk scores |
+
+Per-rule hit rate in PromQL:
+`rate(fre_rule_hits_total[1h]) / ignoring(rule) group_left rate(fre_scored_total[1h])`.
+A jump in one rule's hit rate, or a shift in the score histogram, is the earliest signal of
+upstream data changes or a new attack pattern. Labels carry only rule codes, never account
+names or amounts.
 
 ### Request
 
@@ -214,6 +230,7 @@ make lint typecheck
 | `test_preprocessing.py` | **Leakage tests**: label independence, future invariance, online/offline parity, split gap, forbidden columns |
 | `test_train.py` | End-to-end training on synthetic data, CLI |
 | `test_api.py` | All endpoints, validation, label rejection, batch limits, metrics |
+| `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
 
 ## Docker
 
@@ -290,7 +307,8 @@ are in [docs/cicd.md](docs/cicd.md).
 - [ ] Gradient-boosted model with SHAP explanations, keeping the rules as a floor
 - [ ] Threshold selection from an alert budget on a validation window
 - [ ] Kafka consumer mode for streaming ingestion
-- [ ] Drift monitoring (score distribution, per-rule hit rates)
+- [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
+- [ ] Drift detection (PSI of live score distribution vs the training window, alerting)
 - [ ] Delayed-label feedback loop and shadow deployments
 
 ## Acknowledgements
