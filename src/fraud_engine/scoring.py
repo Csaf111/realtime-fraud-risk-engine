@@ -14,6 +14,7 @@ from .model import LogisticBaseline
 from .rules import DEFAULT_RULES, Rule, RuleContext, evaluate_rules
 from .schemas import Decision, FeatureContribution, RiskResult, RuleHit, Transaction
 from .state import VelocityStore
+from .thresholds import blend_risk
 
 log = logging.getLogger(__name__)
 
@@ -68,11 +69,9 @@ class RiskEngine:
         if self.model is not None:
             model_score, contribs = self.model.explain(features)
             top = [FeatureContribution(feature=f, value=v, contribution=c) for f, v, c in contribs]
-            w = self.settings.model_weight
-            risk = w * model_score + (1 - w) * rules_score
+            risk = blend_risk(model_score, rules_score, self.settings.model_weight)
         else:
-            risk = rules_score
-        risk = round(min(max(risk, 0.0), 1.0), 6)
+            risk = round(min(max(rules_score, 0.0), 1.0), 6)
 
         reasons = [f"{r.code}: {r.description}" for r in hits]
         reasons += [
