@@ -48,7 +48,7 @@ git clone https://github.com/Csaf111/realtime-fraud-risk-engine.git
 cd realtime-fraud-risk-engine
 python -m venv .venv && source .venv/bin/activate
 make install          # pip install -e ".[dev]"
-make test             # 80+ tests, coverage gate 85%
+make test             # 100+ tests, coverage gate 85%
 make run              # http://localhost:8000/docs
 ```
 
@@ -193,6 +193,24 @@ updated **after** it, so a transaction never sees itself or the future.
 recall) on a future, gapped test window. It also writes `models/baseline.metrics.json`
 with the split boundaries and the leakage report.
 
+### Thresholds from an alert budget
+
+Ops teams size queues in capacity, not probabilities. Pass the share of traffic you can
+afford to review and to block, and training recommends matching thresholds:
+
+```bash
+python -m fraud_engine.train --data data/raw/paysim.csv \
+    --review-budget 0.01 --block-budget 0.002   # review ≤ 1%, block ≤ 0.2%
+# ...
+# Recommended: FRE_REVIEW_THRESHOLD=0.41 FRE_BLOCK_THRESHOLD=0.87 FRE_MODEL_WEIGHT=0.6
+```
+
+Thresholds are picked on the most recent `--validation-frac` (default 20%) of the
+training window using only the served score distribution (no labels), then evaluated on
+the held-out test window: `alert_budget.test` in the metrics JSON reports the realised
+alert rate, precision and recall at each level. Scores are computed with the same
+`blend_risk` the API uses, so set `--model-weight` to your `FRE_MODEL_WEIGHT`.
+
 To try the pipeline without the real dataset: `make train-synthetic` (the metrics are
 meaningless, it only proves the plumbing works).
 
@@ -231,6 +249,7 @@ make lint typecheck
 | `test_train.py` | End-to-end training on synthetic data, CLI |
 | `test_api.py` | All endpoints, validation, label rejection, batch limits, metrics |
 | `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
+| `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
 
 ## Docker
 
@@ -305,7 +324,7 @@ are in [docs/cicd.md](docs/cicd.md).
 
 - [ ] Redis-backed `VelocityStore` for multi-replica deployments
 - [ ] Gradient-boosted model with SHAP explanations, keeping the rules as a floor
-- [ ] Threshold selection from an alert budget on a validation window
+- [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
 - [ ] Kafka consumer mode for streaming ingestion
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
 - [ ] Drift detection (PSI of live score distribution vs the training window, alerting)

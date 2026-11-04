@@ -67,6 +67,8 @@ fit_standardiser(train)    → LogisticRegression(class_weight="balanced")
      │
 evaluate on test           (model vs rules-only: ROC-AUC, PR-AUC, precision, recall)
      │
+[optional] alert budget    (thresholds from score quantiles on the train-window tail,
+     │                      label-free; then alert rate/precision/recall on test)
 models/baseline.json + baseline.metrics.json
 ```
 
@@ -76,5 +78,10 @@ models/baseline.json + baseline.metrics.json
 - Choose operating thresholds from an **alert budget** (e.g. "review at most 0.5% of
   traffic"), then report recall at that budget.
 - When tuning thresholds, use a validation window *between* train and test. Never tune on test.
+  `--review-budget/--block-budget` follow this: thresholds come from the most recent slice
+  of the training window and read only the score distribution, never labels. Caveat: the
+  model was fitted on that slice, so its scores there can be slightly more confident than
+  on unseen data. The realised alert rate on the test window (`alert_budget.test`) is the
+  honest check; if it overshoots the budget, tighten it.
 - Always report the **rules-only baseline** next to the model, so you can see what the
   model actually adds.
