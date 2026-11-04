@@ -132,3 +132,37 @@ def test_leakage_checks_reject_single_class(frame):
     test = test.assign(**{LABEL: 0})
     with pytest.raises(LeakageError, match="single class"):
         leakage_checks(train, test, list(FEATURE_NAMES), 5)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("column", ["amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest"])
+def test_schema_rejects_nonfinite_money(raw, column, value):
+    bad = raw.copy()
+    bad.loc[0, column] = value
+    with pytest.raises(ValueError, match="Non-finite"):
+        validate_schema(bad)
+
+
+@pytest.mark.parametrize("value", [-1, None])
+def test_schema_rejects_invalid_step(raw, value):
+    bad = raw.copy()
+    bad["step"] = bad["step"].astype("Int64")
+    bad.loc[0, "step"] = value
+    with pytest.raises(ValueError, match="Invalid transaction step"):
+        validate_schema(bad)
+
+
+def test_schema_rejects_nonbinary_label(raw):
+    bad = raw.copy()
+    bad["isFraud"] = bad["isFraud"].astype("int64")
+    bad.loc[0, "isFraud"] = 2
+    with pytest.raises(ValueError, match="binary"):
+        validate_schema(bad)
+
+
+@pytest.mark.parametrize("column", ["nameOrig", "nameDest"])
+def test_schema_rejects_missing_account_identifier(raw, column):
+    bad = raw.copy()
+    bad.loc[0, column] = None
+    with pytest.raises(ValueError, match="Missing account"):
+        validate_schema(bad)
