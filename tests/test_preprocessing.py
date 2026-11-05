@@ -135,7 +135,9 @@ def test_leakage_checks_reject_single_class(frame):
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
-@pytest.mark.parametrize("column", ["amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest"])
+@pytest.mark.parametrize(
+    "column", ["amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest"]
+)
 def test_schema_rejects_nonfinite_money(raw, column, value):
     bad = raw.copy()
     bad.loc[0, column] = value
