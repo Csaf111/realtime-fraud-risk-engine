@@ -83,10 +83,18 @@ def validate_schema(df: pd.DataFrame) -> None:
     if bad_types:
         raise ValueError(f"Unknown transaction types: {sorted(bad_types)}")
     money = ["amount", "oldbalanceOrg", "newbalanceOrig", "oldbalanceDest", "newbalanceDest"]
+    if not np.isfinite(df[money].to_numpy(dtype=float)).all():
+        raise ValueError("Non-finite monetary values found")
     if (df[money] < 0).any().any():
         raise ValueError("Negative monetary values found")
+    if df["step"].isna().any() or (df["step"] < 0).any():
+        raise ValueError("Invalid transaction step found")
     if df[LABEL].isna().any():
         raise ValueError("Missing labels found")
+    if not df[LABEL].isin([0, 1]).all():
+        raise ValueError("Fraud labels must be binary")
+    if df["nameOrig"].isna().any() or df["nameDest"].isna().any():
+        raise ValueError("Missing account identifiers found")
 
 
 def load_paysim(path: str | Path, nrows: int | None = None) -> pd.DataFrame:
