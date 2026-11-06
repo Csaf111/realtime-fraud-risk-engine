@@ -6,7 +6,6 @@ Run locally:  uvicorn fraud_engine.api:app --reload
 from __future__ import annotations
 
 import logging
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -15,6 +14,7 @@ from fastapi.responses import PlainTextResponse
 from . import __version__
 from .config import Settings
 from .metrics import Metrics
+from .request_ids import safe_request_id
 from .schemas import BatchRequest, BatchResponse, RiskResult, Transaction
 from .scoring import RiskEngine
 
@@ -55,7 +55,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
 
     @app.middleware("http")
     async def request_id(request: Request, call_next):
-        rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+        rid = safe_request_id(request.headers.get("x-request-id"))
         response: Response = await call_next(request)
         response.headers["x-request-id"] = rid
         return response
