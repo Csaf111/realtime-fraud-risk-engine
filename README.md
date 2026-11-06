@@ -171,6 +171,24 @@ decision   = BLOCK if ≥ block_threshold, REVIEW if ≥ review_threshold, else 
 Velocity is computed from a `VelocityStore` that is read **before** the current event and
 updated **after** it, so a transaction never sees itself or the future.
 
+### Shared velocity state (multi-replica)
+
+By default the store is in-process, so each replica only sees its own traffic. Set
+`FRE_VELOCITY_BACKEND=redis` to keep velocity in Redis sorted sets keyed by account
+(`<prefix>:orig:<nameOrig>` / `<prefix>:dest:<nameDest>`, score = step), shared by every
+replica:
+
+```bash
+pip install -e ".[redis]"          # redis-py is optional; the default image stays slim
+FRE_VELOCITY_BACKEND=redis FRE_REDIS_URL=redis://localhost:6379/0 make run
+```
+
+`RedisVelocityStore` implements the same `VelocityBackend` interface and window semantics
+as the in-memory store; a parity test replays a random step-ordered stream through both
+and requires identical snapshots. `snapshot` and `record` are separate round trips, so
+two replicas scoring the *same account* concurrently can miss each other's in-flight
+event; partition traffic by account if you need a strict order.
+
 ## Training on PaySim
 
 1. Get the data (details and licence in [docs/dataset-paysim.md](docs/dataset-paysim.md)):
@@ -242,6 +260,7 @@ make lint typecheck
 |---|---|
 | `test_features.py` | Every feature, ordering contract, edge cases |
 | `test_state.py` | Window maths, no self/future visibility, caps |
+| `test_state_redis.py` | Redis backend (fakeredis): same window semantics, parity with in-memory, shared state across replicas, namespacing |
 | `test_rules.py` | Each rule, capping, ordering, configurable thresholds |
 | `test_model.py` | Contributions sum to the logit, persistence, schema guards |
 | `test_scoring.py` | Rules-only vs blended, decisions, stateful velocity, settings |
@@ -293,6 +312,9 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_HIGH_AMOUNT_THRESHOLD` | `200000` | R003 threshold |
 | `FRE_MAX_BATCH_SIZE` | `1000` | Batch endpoint limit |
 | `FRE_ENVIRONMENT` | `local` | Reported by `/ready` |
+| `FRE_VELOCITY_BACKEND` | `memory` | `memory` (per process) or `redis` (shared across replicas; needs the `redis` extra) |
+| `FRE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL for the `redis` backend |
+| `FRE_REDIS_KEY_PREFIX` | `fre:velocity` | Namespace for velocity keys in Redis |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -303,7 +325,8 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── api.py             FastAPI app (create_app factory)
 │   ├── scoring.py         RiskEngine: features → rules → model → decision
 │   ├── features.py        Shared online/offline feature code
-│   ├── state.py           Point-in-time VelocityStore
+│   ├── state.py           Point-in-time VelocityStore + backend factory
+│   ├── state_redis.py     Redis-backed VelocityStore (optional extra)
 │   ├── rules.py           Rulebook R001–R008
 │   ├── model.py           Pure-Python logistic baseline + exact explanations
 │   ├── preprocessing.py   Leakage-safe PaySim pipeline + checks
@@ -322,7 +345,7 @@ are in [docs/cicd.md](docs/cicd.md).
 
 ## Roadmap
 
-- [ ] Redis-backed `VelocityStore` for multi-replica deployments
+- [x] Redis-backed `VelocityStore` for multi-replica deployments (`FRE_VELOCITY_BACKEND=redis`)
 - [ ] Gradient-boosted model with SHAP explanations, keeping the rules as a floor
 - [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
 - [ ] Kafka consumer mode for streaming ingestion
