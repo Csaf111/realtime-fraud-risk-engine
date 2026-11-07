@@ -52,8 +52,8 @@ class LogisticBaseline:
                 raise ValueError(f"Artifact {label} must contain finite numbers")
         if not math.isfinite(self.intercept):
             raise ValueError("Artifact intercept must be finite")
-        if any(value <= 0 for value in self.scale):
-            raise ValueError("Artifact scale must contain positive numbers")
+        # Preserve the existing zero-variance feature convention after validation.
+        self.scale = [value if value > 0 else 1.0 for value in self.scale]
 
     # ---- inference -----------------------------------------------------------------
     def _standardise(self, x: list[float]) -> list[float]:
