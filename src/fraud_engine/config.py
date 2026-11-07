@@ -30,6 +30,10 @@ class Settings:
             steps (1 step = 1 simulated hour).
         high_amount_threshold: amount above which rule R003 fires.
         max_batch_size: maximum transactions accepted by the batch endpoint.
+        score_reference_path: optional training-time score reference (JSON) for drift
+            monitoring. When set, ``/metrics`` exports ``fre_score_psi``.
+        drift_window: number of most recent live scores compared with the reference.
+        drift_min_samples: live scores needed before PSI is reported.
     """
 
     review_threshold: float = 0.5
@@ -40,6 +44,9 @@ class Settings:
     high_amount_threshold: float = 200_000.0
     max_batch_size: int = 1000
     environment: str = field(default="local")
+    score_reference_path: str | None = None
+    drift_window: int = 5000
+    drift_min_samples: int = 500
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -48,6 +55,10 @@ class Settings:
             raise ValueError("model_weight must be between 0 and 1")
         if self.velocity_window_steps < 1:
             raise ValueError("velocity_window_steps must be >= 1")
+        if self.drift_window < 1:
+            raise ValueError("drift_window must be >= 1")
+        if not 1 <= self.drift_min_samples <= self.drift_window:
+            raise ValueError("drift_min_samples must be between 1 and drift_window")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -60,4 +71,7 @@ class Settings:
             high_amount_threshold=_float("FRE_HIGH_AMOUNT_THRESHOLD", 200_000.0),
             max_batch_size=_int("FRE_MAX_BATCH_SIZE", 1000),
             environment=os.getenv("FRE_ENVIRONMENT", "local"),
+            score_reference_path=os.getenv("FRE_SCORE_REFERENCE_PATH") or None,
+            drift_window=_int("FRE_DRIFT_WINDOW", 5000),
+            drift_min_samples=_int("FRE_DRIFT_MIN_SAMPLES", 500),
         )

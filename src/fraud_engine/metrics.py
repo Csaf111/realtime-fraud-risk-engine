@@ -12,6 +12,10 @@ raw material for drift detection:
 Only rule codes and scores are recorded. Nothing about the transaction itself (accounts,
 amounts) is ever exported as a label, which keeps metric cardinality bounded and avoids
 leaking customer data into the monitoring stack.
+
+When a :class:`~fraud_engine.drift.DriftMonitor` is attached (``FRE_SCORE_REFERENCE_PATH``),
+``fre_score_psi`` reports the PSI of the last ``FRE_DRIFT_WINDOW`` scores against the
+training-time score reference.
 """
 
 from __future__ import annotations
@@ -20,12 +24,16 @@ import threading
 from collections import Counter
 from collections.abc import Iterable
 
+from .drift import SCORE_BUCKETS, DriftMonitor
+
+__all__ = ["SCORE_BUCKETS", "Metrics"]
+
 _BUCKETS_MS = (1, 2, 5, 10, 25, 50, 100, 250)
-SCORE_BUCKETS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 
 
 class Metrics:
-    def __init__(self) -> None:
+    def __init__(self, drift: DriftMonitor | None = None) -> None:
+        self.drift = drift
         self._lock = threading.Lock()
         self.decisions: Counter[str] = Counter()
         self.requests: Counter[str] = Counter()
@@ -59,6 +67,8 @@ class Metrics:
                 for sb in SCORE_BUCKETS:
                     if risk_score <= sb:
                         self.score_buckets[sb] += 1
+                if self.drift is not None:
+                    self.drift.observe(risk_score)
             self.latency_sum += latency_ms
             self.latency_count += 1
             for b in _BUCKETS_MS:
@@ -120,4 +130,22 @@ class Metrics:
                 f"fre_risk_score_sum {self.score_sum:.6f}",
                 f"fre_risk_score_count {self.score_count}",
             ]
+            if self.drift is not None:
+                lines += self._render_drift(self.drift)
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _render_drift(drift: DriftMonitor) -> list[str]:
+        lines = [
+            "# HELP fre_score_drift_window_count Live scores in the drift window.",
+            "# TYPE fre_score_drift_window_count gauge",
+            f"fre_score_drift_window_count {drift.count}",
+        ]
+        value = drift.psi()
+        if value is not None:  # omitted until min_samples scores have been seen
+            lines += [
+                "# HELP fre_score_psi PSI of live risk scores vs the training score reference.",
+                "# TYPE fre_score_psi gauge",
+                f"fre_score_psi {value:.6f}",
+            ]
+        return lines

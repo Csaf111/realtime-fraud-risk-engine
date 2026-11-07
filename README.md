@@ -85,12 +85,41 @@ Every response carries an `x-request-id` header. The API echoes yours or generat
 | `fre_scored_total` | counter | Transactions scored (denominator for hit rates) |
 | `fre_rule_hits_total{rule="R00x"}` | counter | Times each rule fired |
 | `fre_risk_score` | histogram (0.1 … 1.0) | Distribution of final risk scores |
+| `fre_score_psi` | gauge | PSI of the last `FRE_DRIFT_WINDOW` scores vs the training score reference (only with `FRE_SCORE_REFERENCE_PATH`, once `FRE_DRIFT_MIN_SAMPLES` scores are in) |
+| `fre_score_drift_window_count` | gauge | Live scores currently in the drift window |
 
 Per-rule hit rate in PromQL:
 `rate(fre_rule_hits_total[1h]) / ignoring(rule) group_left rate(fre_scored_total[1h])`.
 A jump in one rule's hit rate, or a shift in the score histogram, is the earliest signal of
 upstream data changes or a new attack pattern. Labels carry only rule codes, never account
 names or amounts.
+
+### Score drift (PSI)
+
+Training writes `models/baseline.score_reference.json`: the share of served scores in each
+histogram bin on the most recent `--validation-frac` of the training window, computed with
+`--model-weight` (label-free, never the test window). Serve it alongside the model:
+
+```bash
+FRE_MODEL_PATH=models/baseline.json \
+FRE_SCORE_REFERENCE_PATH=models/baseline.score_reference.json make run
+```
+
+`fre_score_psi` then compares a rolling window of live scores with that reference
+(PSI < 0.1 stable, 0.1–0.25 moderate, > 0.25 significant). A Prometheus alert:
+
+```yaml
+- alert: FraudScoreDrift
+  expr: max(fre_score_psi) > 0.25
+  for: 30m
+  labels: {severity: warning}
+  annotations:
+    summary: "Live fraud score distribution has drifted from the training window"
+```
+
+The window is per replica. Use the reference built with the same `FRE_MODEL_WEIGHT` you
+serve, and retrain the reference whenever the model changes; a bad reference file stops
+the API at startup rather than reporting nonsense.
 
 ### Request
 
@@ -250,6 +279,7 @@ make lint typecheck
 | `test_api.py` | All endpoints, validation, label rejection, batch limits, metrics |
 | `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
 | `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
+| `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
 
@@ -293,6 +323,9 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_HIGH_AMOUNT_THRESHOLD` | `200000` | R003 threshold |
 | `FRE_MAX_BATCH_SIZE` | `1000` | Batch endpoint limit |
 | `FRE_ENVIRONMENT` | `local` | Reported by `/ready` |
+| `FRE_SCORE_REFERENCE_PATH` | unset | Training score reference; enables `fre_score_psi` |
+| `FRE_DRIFT_WINDOW` | `5000` | Live scores in the rolling PSI window |
+| `FRE_DRIFT_MIN_SAMPLES` | `500` | Scores needed before PSI is reported |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -311,6 +344,7 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── synthetic.py       PaySim-shaped generator for CI
 │   ├── schemas.py         Pydantic request/response models
 │   ├── metrics.py         Prometheus-format metrics
+│   ├── drift.py           Score reference + rolling PSI drift monitor
 │   └── config.py          FRE_* settings
 ├── tests/                 Unit, leakage and API tests
 ├── docs/                  Dataset, leakage plan, architecture, CI/CD
@@ -327,7 +361,8 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
 - [ ] Kafka consumer mode for streaming ingestion
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
-- [ ] Drift detection (PSI of live score distribution vs the training window, alerting)
+- [x] Drift detection: PSI of live score distribution vs the training window (`fre_score_psi`, example alert rule)
+- [ ] Feature-level drift (PSI per input feature) and label-delayed performance monitoring
 - [ ] Delayed-label feedback loop and shadow deployments
 
 ## Acknowledgements

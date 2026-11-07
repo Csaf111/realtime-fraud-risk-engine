@@ -14,6 +14,7 @@ from fastapi.responses import PlainTextResponse
 
 from . import __version__
 from .config import Settings
+from .drift import DriftMonitor, ScoreReference
 from .metrics import Metrics
 from .schemas import BatchRequest, BatchResponse, RiskResult, Transaction
 from .scoring import RiskEngine
@@ -31,13 +32,20 @@ def _observe(m: Metrics, result: RiskResult) -> None:
     )
 
 
+def _drift_monitor(settings: Settings) -> DriftMonitor | None:
+    if not settings.score_reference_path:
+        return None
+    reference = ScoreReference.load(settings.score_reference_path)
+    return DriftMonitor(reference, settings.drift_window, settings.drift_min_samples)
+
+
 def create_app(settings: Settings | None = None, engine: RiskEngine | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.engine = engine or RiskEngine(settings)
-        app.state.metrics = Metrics()
+        app.state.metrics = Metrics(drift=_drift_monitor(settings))
         log.info(
             "Engine ready: mode=%s version=%s env=%s",
             app.state.engine.mode,
@@ -74,6 +82,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
             "mode": eng.mode,
             "model_version": eng.model_version,
             "environment": settings.environment,
+            "drift_reference": "loaded" if request.app.state.metrics.drift else "none",
         }
 
     @app.post("/v1/score", response_model=RiskResult, tags=["scoring"])
