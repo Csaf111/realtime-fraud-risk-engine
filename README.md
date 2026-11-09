@@ -214,6 +214,19 @@ alert rate, precision and recall at each level. Scores are computed with the sam
 To try the pipeline without the real dataset: `make train-synthetic` (the metrics are
 meaningless, it only proves the plumbing works).
 
+## Streaming mode (Kafka skeleton)
+
+Score an ordered stream instead of HTTP calls, with the same schema checks and engine:
+
+```bash
+python -m fraud_engine.stream --input txns.jsonl --output results.jsonl --dead-letter dlq.jsonl
+```
+
+Bad messages (invalid JSON, label columns, oversized) go to a dead-letter sink instead of
+stopping the consumer, late events can be rejected with `--allowed-lateness`, and a Kafka
+loop (`--kafka-topic`, optional `confluent-kafka` client) commits offsets only after each
+result is written. Details and ordering caveats: [docs/streaming.md](docs/streaming.md).
+
 ## Architecture
 
 Full diagrams (system context, request sequence, training pipeline, scoring, CI/CD) are in
