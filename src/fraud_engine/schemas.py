@@ -37,13 +37,13 @@ class Transaction(BaseModel):
     transaction_id: str | None = Field(default=None, max_length=128)
     step: int = Field(..., ge=0, description="Simulated hour since start (PaySim 'step').")
     type: TxnType
-    amount: float = Field(..., ge=0)
+    amount: float = Field(..., ge=0, allow_inf_nan=False)
     nameOrig: str = Field(..., min_length=1, max_length=64)
-    oldbalanceOrg: float = Field(..., ge=0)
-    newbalanceOrig: float = Field(..., ge=0)
+    oldbalanceOrg: float = Field(..., ge=0, allow_inf_nan=False)
+    newbalanceOrig: float = Field(..., ge=0, allow_inf_nan=False)
     nameDest: str = Field(..., min_length=1, max_length=64)
-    oldbalanceDest: float = Field(..., ge=0)
-    newbalanceDest: float = Field(..., ge=0)
+    oldbalanceDest: float = Field(..., ge=0, allow_inf_nan=False)
+    newbalanceDest: float = Field(..., ge=0, allow_inf_nan=False)
 
 
 class RuleHit(BaseModel):

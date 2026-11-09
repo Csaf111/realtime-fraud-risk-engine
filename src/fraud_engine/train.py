@@ -9,6 +9,10 @@ Examples:
 
     # Pipeline smoke test on synthetic data (what CI does)
     python -m fraud_engine.train --synthetic 5000 --out models/synthetic.json
+
+    # Recommend thresholds for an alert budget: review <= 1% of traffic, block <= 0.2%
+    python -m fraud_engine.train --data data/raw/paysim.csv --review-budget 0.01 \
+        --block-budget 0.002
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from .preprocessing import (
     temporal_split,
 )
 from .synthetic import write_csv
+from .thresholds import blend_risk, evaluate_thresholds, select_thresholds
 
 
 def _metrics(y: np.ndarray, p: np.ndarray, threshold: float) -> dict[str, float]:
@@ -48,6 +53,49 @@ def _metrics(y: np.ndarray, p: np.ndarray, threshold: float) -> dict[str, float]
     }
 
 
+def _served_scores(model: LogisticBaseline, frame: Any, model_weight: float) -> list[float]:
+    """Blended risk scores for a feature frame, computed exactly as the API serves them."""
+    feats = frame[list(FEATURE_NAMES)].to_dict(orient="records")
+    rules = frame["rules_score"].tolist()
+    return [
+        blend_risk(model.predict_proba(f), float(r), model_weight)
+        for f, r in zip(feats, rules, strict=True)
+    ]
+
+
+def _alert_budget(
+    model: LogisticBaseline,
+    train_df: Any,
+    test_df: Any,
+    review_budget: float,
+    block_budget: float,
+    validation_frac: float,
+    model_weight: float,
+) -> dict[str, Any]:
+    """Pick thresholds on the most recent slice of the training window, report on test.
+
+    Selection is label-free (score quantiles only) and never sees the test window.
+    """
+    n_val = max(1, round(len(train_df) * validation_frac))
+    val_df = train_df.iloc[-n_val:]  # train_df is chronologically sorted
+    selection = select_thresholds(
+        _served_scores(model, val_df, model_weight), review_budget, block_budget
+    )
+    test_scores = _served_scores(model, test_df, model_weight)
+    return {
+        **selection.as_dict(),
+        "model_weight": model_weight,
+        "validation_rows": len(val_df),
+        "validation_steps": [int(val_df["step"].min()), int(val_df["step"].max())],
+        "test": evaluate_thresholds(
+            test_scores,
+            test_df[LABEL].astype(int).tolist(),
+            selection.review_threshold,
+            selection.block_threshold,
+        ),
+    }
+
+
 def train(
     data_path: str | Path,
     out_path: str | Path,
@@ -57,7 +105,15 @@ def train(
     window_steps: int = 24,
     C: float = 1.0,
     version: str | None = None,
+    review_budget: float | None = None,
+    block_budget: float | None = None,
+    validation_frac: float = 0.2,
+    model_weight: float = 0.6,
 ) -> dict[str, Any]:
+    if (review_budget is None) != (block_budget is None):
+        raise ValueError("review_budget and block_budget must be given together")
+    if not 0.0 < validation_frac < 1.0:
+        raise ValueError("validation_frac must be between 0 and 1")
     raw = load_paysim(data_path, nrows=nrows)
     frame = build_feature_frame(raw, window_steps=window_steps)
     train_df, test_df, split = temporal_split(frame, test_frac=test_frac, gap_steps=gap_steps)
@@ -94,6 +150,10 @@ def train(
         "window_steps": window_steps,
         "C": C,
     }
+    if review_budget is not None and block_budget is not None:
+        metrics["alert_budget"] = _alert_budget(
+            model, train_df, test_df, review_budget, block_budget, validation_frac, model_weight
+        )
     model.metadata = {"trained_at": datetime.now(UTC).isoformat(), "metrics": metrics}
     model.save(out_path)
     Path(out_path).with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -114,7 +174,25 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--window-steps", type=int, default=24)
     ap.add_argument("--C", type=float, default=1.0)
     ap.add_argument("--version", default=None)
+    ap.add_argument(
+        "--review-budget",
+        type=float,
+        default=None,
+        help="Max share of traffic sent to REVIEW or BLOCK (e.g. 0.01); needs --block-budget",
+    )
+    ap.add_argument("--block-budget", type=float, default=None, help="Max share of traffic BLOCKed")
+    ap.add_argument(
+        "--validation-frac",
+        type=float,
+        default=0.2,
+        help="Most recent share of the training window used to pick thresholds",
+    )
+    ap.add_argument(
+        "--model-weight", type=float, default=0.6, help="Blend weight, as FRE_MODEL_WEIGHT"
+    )
     a = ap.parse_args(argv)
+    if (a.review_budget is None) != (a.block_budget is None):
+        ap.error("--review-budget and --block-budget must be given together")
 
     if a.synthetic:
         tmp = Path(tempfile.mkdtemp()) / "synthetic.csv"
@@ -122,10 +200,32 @@ def main(argv: list[str] | None = None) -> None:
     else:
         data = Path(a.data)
 
-    m = train(data, a.out, a.nrows, a.test_frac, a.gap_steps, a.window_steps, a.C, a.version)
-    print(
-        json.dumps({"model": m["model"], "rules_only_baseline": m["rules_only_baseline"]}, indent=2)
+    m = train(
+        data,
+        a.out,
+        a.nrows,
+        a.test_frac,
+        a.gap_steps,
+        a.window_steps,
+        a.C,
+        a.version,
+        review_budget=a.review_budget,
+        block_budget=a.block_budget,
+        validation_frac=a.validation_frac,
+        model_weight=a.model_weight,
     )
+    summary = {"model": m["model"], "rules_only_baseline": m["rules_only_baseline"]}
+    if "alert_budget" in m:
+        summary["alert_budget"] = m["alert_budget"]
+    print(json.dumps(summary, indent=2))
+    if "alert_budget" in m:
+        ab = m["alert_budget"]
+        if not ab["budget_met"]:
+            print("WARNING: alert budget not attainable on the validation window (score ties)")
+        print(
+            f"Recommended: FRE_REVIEW_THRESHOLD={ab['review_threshold']} "
+            f"FRE_BLOCK_THRESHOLD={ab['block_threshold']} FRE_MODEL_WEIGHT={a.model_weight}"
+        )
     print(f"Saved model to {a.out}")
 
 
