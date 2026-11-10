@@ -7,7 +7,7 @@ flowchart LR
     client["Payment / wallet service"] -- "POST /v1/score<br/>(transaction JSON)" --> api
     subgraph engine["realtime-fraud-risk-engine (container)"]
         api["FastAPI app"] --> core["RiskEngine"]
-        core --> state[("VelocityStore<br/>in-memory")]
+        core --> state[("VelocityStore<br/>in-memory or Redis")]
         core --> rules["Rulebook R001–R008"]
         core --> model["Logistic baseline<br/>(optional JSON artifact)"]
     end
@@ -105,9 +105,9 @@ flowchart LR
 
 | Concern | Today (starter) | Next step |
 |---|---|---|
-| Velocity state | In-process dict of deques, one worker per container | Redis sorted sets keyed by account (`ZADD`/`ZRANGEBYSCORE`), same interface |
+| Velocity state | In-process deques by default; `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + SHAP. Keep the rules as a floor |
-| Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer, once state is shared |
+| Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
 | Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI vs training reference | Feature-level drift, delayed-label precision/recall |

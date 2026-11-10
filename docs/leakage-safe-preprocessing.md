@@ -51,7 +51,11 @@ that blocks it. Each control is enforced in code and covered by a test.
 - **Within-step ordering.** PaySim gives hour-level timestamps. Rows inside the same step
   are replayed in file order, which is assumed to be event order.
 - **Per-process state.** The in-memory `VelocityStore` is per replica. With several
-  replicas, velocity is undercounted unless the store moves to shared storage such as Redis.
+  replicas, set `FRE_VELOCITY_BACKEND=redis`: `RedisVelocityStore` applies the same
+  `(step - window, step]` filter and is parity-tested against the in-memory store, so
+  offline (training replay, always in-memory) and online features stay identical.
+  Concurrent requests for the same account are still unordered between `snapshot` and
+  `record`; partition by account if strict ordering matters.
 
 ## Pipeline order (what `fraud_engine.train` does)
 

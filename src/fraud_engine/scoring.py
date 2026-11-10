@@ -13,7 +13,7 @@ from .features import compute_features
 from .model import LogisticBaseline
 from .rules import DEFAULT_RULES, Rule, RuleContext, evaluate_rules
 from .schemas import Decision, FeatureContribution, RiskResult, RuleHit, Transaction
-from .state import VelocityStore
+from .state import VelocityBackend, build_velocity_store
 from .thresholds import blend_risk
 
 log = logging.getLogger(__name__)
@@ -24,11 +24,11 @@ class RiskEngine:
         self,
         settings: Settings | None = None,
         model: LogisticBaseline | None = None,
-        store: VelocityStore | None = None,
+        store: VelocityBackend | None = None,
         rules: tuple[Rule, ...] = DEFAULT_RULES,
     ) -> None:
         self.settings = settings or Settings()
-        self.store = store or VelocityStore(self.settings.velocity_window_steps)
+        self.store = store if store is not None else build_velocity_store(self.settings)
         self.rules = rules
         self.rule_ctx = RuleContext(high_amount_threshold=self.settings.high_amount_threshold)
         self.model = model
