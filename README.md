@@ -358,6 +358,9 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_VELOCITY_BACKEND` | `memory` | `memory` (per process) or `redis` (shared across replicas; needs the `redis` extra) |
 | `FRE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL for the `redis` backend |
 | `FRE_REDIS_KEY_PREFIX` | `fre:velocity` | Namespace for velocity keys in Redis |
+| `FRE_SCORE_REFERENCE_PATH` | unset | Training score reference; enables `fre_score_psi` |
+| `FRE_DRIFT_WINDOW` | `5000` | Live scores in the rolling PSI window |
+| `FRE_DRIFT_MIN_SAMPLES` | `500` | Scores needed before PSI is reported |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
