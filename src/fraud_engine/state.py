@@ -7,8 +7,11 @@ they are served. That removes a whole class of train/serve skew.
 Leakage guarantee: ``snapshot()`` is always called *before* ``record()`` for the current
 event, so a transaction never sees itself or anything that happened after it.
 
-The in-memory implementation is per-process. For multi-replica deployments swap it for a
-shared store (e.g. Redis sorted sets keyed by account) behind the same interface.
+The in-memory implementation is per-process. For multi-replica deployments use
+:class:`fraud_engine.state_redis.RedisVelocityStore` (Redis sorted sets keyed by account),
+which implements the same :class:`VelocityBackend` interface and produces identical
+snapshots for the same event stream. :func:`build_velocity_store` picks the backend from
+:class:`~fraud_engine.config.Settings`.
 """
 
 from __future__ import annotations
@@ -16,6 +19,10 @@ from __future__ import annotations
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from .config import Settings
 
 
 @dataclass(frozen=True)
@@ -24,6 +31,23 @@ class VelocitySnapshot:
     orig_amount_sum: float = 0.0
     dest_inbound_count: int = 0
     dest_inbound_sum: float = 0.0
+
+
+@runtime_checkable
+class VelocityBackend(Protocol):
+    """Interface every velocity store implements (in-memory, Redis, ...).
+
+    Contract: ``snapshot`` returns only events with ``step - window_steps < ev_step <= step``
+    that were ``record``-ed earlier; callers must snapshot *before* recording the event.
+    """
+
+    window_steps: int
+
+    def snapshot(self, name_orig: str, name_dest: str, step: int) -> VelocitySnapshot: ...
+
+    def record(self, name_orig: str, name_dest: str, step: int, amount: float) -> None: ...
+
+    def reset(self) -> None: ...
 
 
 class VelocityStore:
@@ -75,3 +99,20 @@ class VelocityStore:
 
     def __len__(self) -> int:
         return len(self._orig) + len(self._dest)
+
+
+def build_velocity_store(settings: Settings) -> VelocityBackend:
+    """Create the velocity store configured by ``settings.velocity_backend``.
+
+    ``memory`` (default) is per-process; ``redis`` shares state across replicas and needs
+    the optional ``redis`` extra (``pip install "realtime-fraud-risk-engine[redis]"``).
+    """
+    if settings.velocity_backend == "redis":
+        from .state_redis import RedisVelocityStore
+
+        return RedisVelocityStore.from_url(
+            settings.redis_url,
+            window_steps=settings.velocity_window_steps,
+            key_prefix=settings.redis_key_prefix,
+        )
+    return VelocityStore(settings.velocity_window_steps)
