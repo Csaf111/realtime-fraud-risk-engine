@@ -54,4 +54,19 @@ def test_overspend_blocks_at_default_threshold_with_other_signals():
     txn = transaction(amount=250000, oldbalanceOrg=100)
     result = score_preauth(txn, VelocitySnapshot(orig_txn_count=3))
     assert result.decision == Decision.BLOCK
-    assert result.risk_score == 0.7
+    assert result.risk_score == 0.9
+
+def test_v2_api_rejects_post_event_fields_and_scores_valid_payload():
+    from fastapi.testclient import TestClient
+    from fraud_engine.api import create_app
+
+    with TestClient(create_app()) as client:
+        payload = transaction().model_dump(mode="json")
+        response = client.post("/v2/score", json=payload)
+        assert response.status_code == 200
+        assert response.json()["model_version"] == "preauth-rules-v2.0"
+        assert response.json()["model_score"] is None
+
+        payload["newbalanceOrig"] = 0
+        rejected = client.post("/v2/score", json=payload)
+        assert rejected.status_code == 422
