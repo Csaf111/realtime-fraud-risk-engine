@@ -16,19 +16,27 @@ from . import __version__
 from .config import Settings
 from .metrics import Metrics
 from .schemas import BatchRequest, BatchResponse, RiskResult, Transaction
-from .scoring import RiskEngine
+from .scoring import RiskEngine, ShadowResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("fraud_engine.api")
 
 
-def _observe(m: Metrics, result: RiskResult) -> None:
+def _observe(m: Metrics, result: RiskResult, shadow: ShadowResult | None = None) -> None:
     m.observe(
         result.decision.value,
         result.latency_ms,
         risk_score=result.risk_score,
         rule_codes=[h.code for h in result.rule_hits],
     )
+    if shadow is not None:
+        m.observe_shadow(
+            result.decision.value,
+            result.risk_score,
+            None if shadow.decision is None else shadow.decision.value,
+            shadow.risk_score,
+            shadow.latency_ms,
+        )
 
 
 def create_app(settings: Settings | None = None, engine: RiskEngine | None = None) -> FastAPI:
@@ -69,12 +77,15 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
     def ready(request: Request) -> dict[str, str]:
         """Readiness: the engine (and model, if configured) is loaded."""
         eng: RiskEngine = request.app.state.engine
-        return {
+        body = {
             "status": "ready",
             "mode": eng.mode,
             "model_version": eng.model_version,
             "environment": settings.environment,
         }
+        if eng.shadow_model_version is not None:
+            body["shadow_model_version"] = eng.shadow_model_version
+        return body
 
     @app.post("/v1/score", response_model=RiskResult, tags=["scoring"])
     def score(txn: Transaction, request: Request) -> RiskResult:
@@ -82,8 +93,8 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         eng: RiskEngine = request.app.state.engine
         m: Metrics = request.app.state.metrics
         m.request("score")
-        result = eng.score(txn)
-        _observe(m, result)
+        result, shadow = eng.score_with_shadow(txn)
+        _observe(m, result, shadow)
         return result
 
     @app.post("/v1/score/batch", response_model=BatchResponse, tags=["scoring"])
@@ -99,8 +110,8 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         m.request("score_batch")
         results = []
         for t in batch.transactions:
-            r = eng.score(t, update_state=batch.update_state)
-            _observe(m, r)
+            r, shadow = eng.score_with_shadow(t, update_state=batch.update_state)
+            _observe(m, r, shadow)
             results.append(r)
         return BatchResponse(results=results, count=len(results))
 
