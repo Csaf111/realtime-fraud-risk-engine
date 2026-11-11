@@ -5,7 +5,6 @@ balances and must never be silently reused for an authorisation decision.
 """
 from __future__ import annotations
 
-import math
 import time
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,13 +47,21 @@ def score_preauth(
         hit("P002", "High-value transaction", 15)
     if txn.type != TxnType.CASH_IN and txn.amount > txn.oldbalanceOrg:
         hit("P003", "Requested debit exceeds available origin balance", 30)
-    if txn.type != TxnType.CASH_IN and txn.oldbalanceOrg > 0 and txn.amount / txn.oldbalanceOrg >= 0.95:
+    if (
+        txn.type != TxnType.CASH_IN
+        and txn.oldbalanceOrg > 0
+        and txn.amount / txn.oldbalanceOrg >= 0.95
+    ):
         hit("P004", "Requested debit consumes at least 95% of available balance", 20)
     if velocity.orig_txn_count >= 3:
         hit("P005", "Origin has at least three recent prior transactions", 10)
     if velocity.dest_inbound_count >= 5:
         hit("P006", "Destination has at least five recent prior inbound transactions", 15)
-    if not txn.nameDest.startswith("M") and txn.amount > 0 and txn.oldbalanceOrg == 0:
+    if (
+        not txn.nameDest.startswith("M")
+        and txn.amount > 0
+        and txn.oldbalanceOrg == 0
+    ):
         hit("P007", "Positive payment from an origin with zero available balance", 10)
 
     risk = round(min(sum(h.points for h in hits) / 100, 1.0), 6)
