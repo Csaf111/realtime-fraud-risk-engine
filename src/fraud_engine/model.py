@@ -46,7 +46,14 @@ class LogisticBaseline:
                 "Artifact features do not match the engine's FEATURE_NAMES; "
                 "retrain the model with the current feature code."
             )
-        self.scale = [s if s > 0 else 1.0 for s in self.scale]
+        # Reject corrupt model parameters rather than silently changing inference.
+        for label, values in (("mean", self.mean), ("scale", self.scale), ("coef", self.coef)):
+            if any(not math.isfinite(value) for value in values):
+                raise ValueError(f"Artifact {label} must contain finite numbers")
+        if not math.isfinite(self.intercept):
+            raise ValueError("Artifact intercept must be finite")
+        # Preserve the existing zero-variance feature convention after validation.
+        self.scale = [value if value > 0 else 1.0 for value in self.scale]
 
     # ---- inference -----------------------------------------------------------------
     def _standardise(self, x: list[float]) -> list[float]:
@@ -54,6 +61,8 @@ class LogisticBaseline:
 
     def contributions(self, features: Mapping[str, float]) -> dict[str, float]:
         x = [float(features[f]) for f in self.feature_names]
+        if any(not math.isfinite(value) for value in x):
+            raise ValueError("Model features must contain finite numbers")
         z = self._standardise(x)
         return {f: c * zi for f, c, zi in zip(self.feature_names, self.coef, z, strict=True)}
 
