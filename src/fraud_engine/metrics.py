@@ -16,6 +16,10 @@ can be judged on real traffic before it is promoted.
 Only rule codes, decisions and scores are recorded. Nothing about the transaction itself (accounts,
 amounts) is ever exported as a label, which keeps metric cardinality bounded and avoids
 leaking customer data into the monitoring stack.
+
+When a :class:`~fraud_engine.drift.DriftMonitor` is attached (``FRE_SCORE_REFERENCE_PATH``),
+``fre_score_psi`` reports the PSI of the last ``FRE_DRIFT_WINDOW`` scores against the
+training-time score reference.
 """
 
 from __future__ import annotations
@@ -24,12 +28,16 @@ import threading
 from collections import Counter
 from collections.abc import Iterable
 
+from .drift import SCORE_BUCKETS, DriftMonitor
+
+__all__ = ["SCORE_BUCKETS", "Metrics"]
+
 _BUCKETS_MS = (1, 2, 5, 10, 25, 50, 100, 250)
-SCORE_BUCKETS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 
 
 class Metrics:
-    def __init__(self) -> None:
+    def __init__(self, drift: DriftMonitor | None = None) -> None:
+        self.drift = drift
         self._lock = threading.Lock()
         self.decisions: Counter[str] = Counter()
         self.requests: Counter[str] = Counter()
@@ -69,6 +77,8 @@ class Metrics:
                 for sb in SCORE_BUCKETS:
                     if risk_score <= sb:
                         self.score_buckets[sb] += 1
+                if self.drift is not None:
+                    self.drift.observe(risk_score)
             self.latency_sum += latency_ms
             self.latency_count += 1
             for b in _BUCKETS_MS:
@@ -150,39 +160,22 @@ class Metrics:
                 f"fre_risk_score_sum {self.score_sum:.6f}",
                 f"fre_risk_score_count {self.score_count}",
             ]
-            if self.shadow_scored or self.shadow_errors:
-                lines += self._render_shadow()
+            if self.drift is not None:
+                lines += self._render_drift(self.drift)
         return "\n".join(lines) + "\n"
 
-    def _render_shadow(self) -> list[str]:
+    @staticmethod
+    def _render_drift(drift: DriftMonitor) -> list[str]:
         lines = [
-            "# HELP fre_shadow_scored_total Transactions the shadow model scored successfully.",
-            "# TYPE fre_shadow_scored_total counter",
-            f"fre_shadow_scored_total {self.shadow_scored}",
-            "# HELP fre_shadow_errors_total Shadow scoring failures (primary unaffected).",
-            "# TYPE fre_shadow_errors_total counter",
-            f"fre_shadow_errors_total {self.shadow_errors}",
-            "# HELP fre_shadow_decisions_total Decisions the shadow model would have made.",
-            "# TYPE fre_shadow_decisions_total counter",
+            "# HELP fre_score_drift_window_count Live scores in the drift window.",
+            "# TYPE fre_score_drift_window_count gauge",
+            f"fre_score_drift_window_count {drift.count}",
         ]
-        lines += [
-            f'fre_shadow_decisions_total{{decision="{k}"}} {v}'
-            for k, v in sorted(self.shadow_decisions.items())
-        ]
-        lines += [
-            "# HELP fre_shadow_disagreements_total Live vs shadow decision mismatches.",
-            "# TYPE fre_shadow_disagreements_total counter",
-        ]
-        lines += [
-            f'fre_shadow_disagreements_total{{primary="{p}",shadow="{s}"}} {v}'
-            for (p, s), v in sorted(self.shadow_disagreements.items())
-        ]
-        lines += [
-            "# HELP fre_shadow_abs_score_delta_sum Sum of |shadow - live| risk score.",
-            "# TYPE fre_shadow_abs_score_delta_sum counter",
-            f"fre_shadow_abs_score_delta_sum {self.shadow_abs_delta_sum:.6f}",
-            "# HELP fre_shadow_latency_ms_sum Total extra latency spent on shadow scoring.",
-            "# TYPE fre_shadow_latency_ms_sum counter",
-            f"fre_shadow_latency_ms_sum {self.shadow_latency_sum:.3f}",
-        ]
+        value = drift.psi()
+        if value is not None:  # omitted until min_samples scores have been seen
+            lines += [
+                "# HELP fre_score_psi PSI of live risk scores vs the training score reference.",
+                "# TYPE fre_score_psi gauge",
+                f"fre_score_psi {value:.6f}",
+            ]
         return lines

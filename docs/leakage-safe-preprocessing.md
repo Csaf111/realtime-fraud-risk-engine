@@ -33,6 +33,7 @@ that blocks it. Each control is enforced in code and covered by a test.
 | L10 | `step` as a raw feature | Lets the model learn "fraud happened late in the month" | Only cyclic hour-of-day (`hour_sin/cos`) is used | `test_leakage_checks_reject_forbidden_features` |
 | L11 | Train/serve skew | Offline pandas features differ subtly from online code | Shared code path. Parity test replays rows online and compares | `test_offline_features_match_online` |
 | L12 | Single-class partition | Metrics silently become undefined or misleading | `leakage_checks` asserts both classes in train and test | `test_leakage_checks_reject_single_class` |
+| L13 | Drift baseline built from labels or the test window | A reference tuned on the evaluation period hides real drift and quietly reuses held-out data | `ScoreReference` is built from served scores on the train-window tail only; labels are never read | `test_reference_is_label_independent`, `test_train_writes_reference_from_training_window_only` |
 
 ## Known risks that remain (be honest about them)
 
@@ -73,7 +74,9 @@ evaluate on test           (model vs rules-only: ROC-AUC, PR-AUC, precision, rec
      │
 [optional] alert budget    (thresholds from score quantiles on the train-window tail,
      │                      label-free; then alert rate/precision/recall on test)
-models/baseline.json + baseline.metrics.json
+score reference            (binned served scores on the same train-window tail,
+     │                      label-free, never the test window → drift PSI baseline)
+models/baseline.json + baseline.metrics.json + baseline.score_reference.json
 ```
 
 ## Evaluation guidance

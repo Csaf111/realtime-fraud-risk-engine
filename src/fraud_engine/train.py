@@ -28,6 +28,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, precision_score, recall_score, roc_auc_score
 
+from .drift import ScoreReference
 from .features import FEATURE_NAMES
 from .model import LogisticBaseline
 from .preprocessing import (
@@ -63,6 +64,33 @@ def _served_scores(model: LogisticBaseline, frame: Any, model_weight: float) -> 
     ]
 
 
+def _validation_slice(train_df: Any, validation_frac: float) -> Any:
+    """Most recent ``validation_frac`` of the (chronologically sorted) training window."""
+    n_val = max(1, round(len(train_df) * validation_frac))
+    return train_df.iloc[-n_val:]
+
+
+def reference_path_for(model_path: str | Path) -> Path:
+    """Where the score reference for a model artifact is written."""
+    return Path(model_path).with_suffix(".score_reference.json")
+
+
+def _score_reference(
+    model: LogisticBaseline, train_df: Any, validation_frac: float, model_weight: float
+) -> ScoreReference:
+    """Served-score distribution on the most recent slice of the training window.
+
+    Label-free and never touches the test window, like threshold selection.
+    """
+    val_df = _validation_slice(train_df, validation_frac)
+    return ScoreReference.from_scores(
+        _served_scores(model, val_df, model_weight),
+        model_weight=model_weight,
+        steps=[int(val_df["step"].min()), int(val_df["step"].max())],
+        model_version=model.version,
+    )
+
+
 def _alert_budget(
     model: LogisticBaseline,
     train_df: Any,
@@ -76,8 +104,7 @@ def _alert_budget(
 
     Selection is label-free (score quantiles only) and never sees the test window.
     """
-    n_val = max(1, round(len(train_df) * validation_frac))
-    val_df = train_df.iloc[-n_val:]  # train_df is chronologically sorted
+    val_df = _validation_slice(train_df, validation_frac)
     selection = select_thresholds(
         _served_scores(model, val_df, model_weight), review_budget, block_budget
     )
@@ -154,8 +181,17 @@ def train(
         metrics["alert_budget"] = _alert_budget(
             model, train_df, test_df, review_budget, block_budget, validation_frac, model_weight
         )
+    reference = _score_reference(model, train_df, validation_frac, model_weight)
+    ref_path = reference_path_for(out_path)
+    metrics["score_reference"] = {
+        "path": str(ref_path),
+        "rows": reference.n,
+        "steps": reference.steps,
+        "model_weight": model_weight,
+    }
     model.metadata = {"trained_at": datetime.now(UTC).isoformat(), "metrics": metrics}
     model.save(out_path)
+    reference.save(ref_path)
     Path(out_path).with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2))
     return metrics
 
@@ -185,7 +221,8 @@ def main(argv: list[str] | None = None) -> None:
         "--validation-frac",
         type=float,
         default=0.2,
-        help="Most recent share of the training window used to pick thresholds",
+        help="Most recent share of the training window used for thresholds and the drift "
+        "score reference",
     )
     ap.add_argument(
         "--model-weight", type=float, default=0.6, help="Blend weight, as FRE_MODEL_WEIGHT"
@@ -227,6 +264,7 @@ def main(argv: list[str] | None = None) -> None:
             f"FRE_BLOCK_THRESHOLD={ab['block_threshold']} FRE_MODEL_WEIGHT={a.model_weight}"
         )
     print(f"Saved model to {a.out}")
+    print(f"Saved drift score reference to {m['score_reference']['path']}")
 
 
 if __name__ == "__main__":  # pragma: no cover

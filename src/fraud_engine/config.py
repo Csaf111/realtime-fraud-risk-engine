@@ -37,10 +37,10 @@ class Settings:
             replicas; requires the ``redis`` extra).
         redis_url: connection URL used when ``velocity_backend == "redis"``.
         redis_key_prefix: namespace for velocity keys in Redis.
-        shadow_model_path: optional path to a candidate model artifact scored in *shadow*
-            mode: it sees exactly the same point-in-time features as the primary path,
-            but its score never changes the API response, the decision or the velocity
-            state. Only aggregate agreement metrics are exported.
+        score_reference_path: optional training-time score reference (JSON) for drift
+            monitoring. When set, ``/metrics`` exports ``fre_score_psi``.
+        drift_window: number of most recent live scores compared with the reference.
+        drift_min_samples: live scores needed before PSI is reported.
     """
 
     review_threshold: float = 0.5
@@ -54,7 +54,9 @@ class Settings:
     velocity_backend: str = "memory"
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "fre:velocity"
-    shadow_model_path: str | None = None
+    score_reference_path: str | None = None
+    drift_window: int = 5000
+    drift_min_samples: int = 500
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -67,6 +69,10 @@ class Settings:
             raise ValueError(f"velocity_backend must be one of {sorted(VELOCITY_BACKENDS)}")
         if not self.redis_key_prefix:
             raise ValueError("redis_key_prefix must be non-empty")
+        if self.drift_window < 1:
+            raise ValueError("drift_window must be >= 1")
+        if not 1 <= self.drift_min_samples <= self.drift_window:
+            raise ValueError("drift_min_samples must be between 1 and drift_window")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -82,5 +88,7 @@ class Settings:
             velocity_backend=(os.getenv("FRE_VELOCITY_BACKEND") or "memory").strip().lower(),
             redis_url=os.getenv("FRE_REDIS_URL") or "redis://localhost:6379/0",
             redis_key_prefix=os.getenv("FRE_REDIS_KEY_PREFIX") or "fre:velocity",
-            shadow_model_path=os.getenv("FRE_SHADOW_MODEL_PATH") or None,
+            score_reference_path=os.getenv("FRE_SCORE_REFERENCE_PATH") or None,
+            drift_window=_int("FRE_DRIFT_WINDOW", 5000),
+            drift_min_samples=_int("FRE_DRIFT_MIN_SAMPLES", 500),
         )
