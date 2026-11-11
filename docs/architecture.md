@@ -62,7 +62,7 @@ flowchart TD
     checks -- ok --> scale["fit_standardiser(train only)"]
     scale --> fit["LogisticRegression<br/>class_weight=balanced"]
     fit --> eval["Evaluate on test<br/>model vs rules-only"]
-    eval --> art[("models/baseline.json<br/>+ metrics.json")]
+    eval --> art[("models/baseline.json<br/>+ metrics.json<br/>+ score_reference.json")]
     art -. "FRE_MODEL_PATH" .-> serve["API / container"]
 ```
 
@@ -110,4 +110,4 @@ flowchart LR
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
-| Monitoring | Counters + latency histogram | Score-distribution drift, alert rate, per-rule hit rate |
+| Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI vs training reference | Feature-level drift, delayed-label precision/recall |
