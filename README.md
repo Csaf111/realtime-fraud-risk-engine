@@ -87,12 +87,20 @@ Every response carries an `x-request-id` header. The API echoes yours or generat
 | `fre_risk_score` | histogram (0.1 … 1.0) | Distribution of final risk scores |
 | `fre_score_psi` | gauge | PSI of the last `FRE_DRIFT_WINDOW` scores vs the training score reference (only with `FRE_SCORE_REFERENCE_PATH`, once `FRE_DRIFT_MIN_SAMPLES` scores are in) |
 | `fre_score_drift_window_count` | gauge | Live scores currently in the drift window |
+| `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
+| `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
+| `fre_shadow_disagreements_total{primary,shadow}` | counter | Live vs shadow decision mismatches |
+| `fre_shadow_abs_score_delta_sum`, `fre_shadow_latency_ms_sum` | counter | Score gap and extra latency, for averages |
 
 Per-rule hit rate in PromQL:
 `rate(fre_rule_hits_total[1h]) / ignoring(rule) group_left rate(fre_scored_total[1h])`.
 A jump in one rule's hit rate, or a shift in the score histogram, is the earliest signal of
 upstream data changes or a new attack pattern. Labels carry only rule codes, never account
 names or amounts.
+
+Shadow disagreement rate in PromQL:
+`sum(rate(fre_shadow_disagreements_total[1h])) / rate(fre_shadow_scored_total[1h])`.
+Watch the `primary="APPROVE",shadow="BLOCK"` cell before promoting a candidate model.
 
 ### Score drift (PSI)
 
@@ -361,6 +369,7 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_SCORE_REFERENCE_PATH` | unset | Training score reference; enables `fre_score_psi` |
 | `FRE_DRIFT_WINDOW` | `5000` | Live scores in the rolling PSI window |
 | `FRE_DRIFT_MIN_SAMPLES` | `500` | Scores needed before PSI is reported |
+| `FRE_SHADOW_MODEL_PATH` | unset | Candidate model scored in shadow mode: same features, never affects the response; compared via `fre_shadow_*` metrics |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -399,7 +408,8 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
 - [x] Drift detection: PSI of live score distribution vs the training window (`fre_score_psi`, example alert rule)
 - [ ] Feature-level drift (PSI per input feature) and label-delayed performance monitoring
-- [ ] Delayed-label feedback loop and shadow deployments
+- [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
+- [ ] Delayed-label feedback loop
 
 ## Acknowledgements
 

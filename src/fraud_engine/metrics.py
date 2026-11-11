@@ -162,7 +162,42 @@ class Metrics:
             ]
             if self.drift is not None:
                 lines += self._render_drift(self.drift)
+            if self.shadow_scored or self.shadow_errors:
+                lines += self._render_shadow()
         return "\n".join(lines) + "\n"
+
+    def _render_shadow(self) -> list[str]:
+        lines = [
+            "# HELP fre_shadow_scored_total Transactions the shadow model scored successfully.",
+            "# TYPE fre_shadow_scored_total counter",
+            f"fre_shadow_scored_total {self.shadow_scored}",
+            "# HELP fre_shadow_errors_total Shadow scoring failures (primary unaffected).",
+            "# TYPE fre_shadow_errors_total counter",
+            f"fre_shadow_errors_total {self.shadow_errors}",
+            "# HELP fre_shadow_decisions_total Decisions the shadow model would have made.",
+            "# TYPE fre_shadow_decisions_total counter",
+        ]
+        lines += [
+            f'fre_shadow_decisions_total{{decision="{k}"}} {v}'
+            for k, v in sorted(self.shadow_decisions.items())
+        ]
+        lines += [
+            "# HELP fre_shadow_disagreements_total Live vs shadow decision mismatches.",
+            "# TYPE fre_shadow_disagreements_total counter",
+        ]
+        lines += [
+            f'fre_shadow_disagreements_total{{primary="{p}",shadow="{s}"}} {v}'
+            for (p, s), v in sorted(self.shadow_disagreements.items())
+        ]
+        lines += [
+            "# HELP fre_shadow_abs_score_delta_sum Sum of |shadow - live| risk score.",
+            "# TYPE fre_shadow_abs_score_delta_sum counter",
+            f"fre_shadow_abs_score_delta_sum {self.shadow_abs_delta_sum:.6f}",
+            "# HELP fre_shadow_latency_ms_sum Total extra latency spent on shadow scoring.",
+            "# TYPE fre_shadow_latency_ms_sum counter",
+            f"fre_shadow_latency_ms_sum {self.shadow_latency_sum:.3f}",
+        ]
+        return lines
 
     @staticmethod
     def _render_drift(drift: DriftMonitor) -> list[str]:
