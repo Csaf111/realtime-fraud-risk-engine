@@ -1,10 +1,18 @@
-"""The risk engine: features -> rules (+ optional model) -> score, decision, reasons."""
+"""The risk engine: features -> rules (+ optional model) -> score, decision, reasons.
+
+Optionally a *shadow* model is scored next to the primary path. It receives exactly the
+same point-in-time features and rules score (computed once, before the event is recorded
+in the velocity store), so a shadow comparison has online/offline parity by construction.
+The shadow result never reaches the API response, the decision or the velocity state.
+"""
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from . import __version__
@@ -19,6 +27,29 @@ from .thresholds import blend_risk
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ShadowResult:
+    """What the shadow model *would* have decided. Internal: only aggregated into metrics.
+
+    ``risk_score`` and ``decision`` are ``None`` when the shadow model raised; the error is
+    logged and swallowed so a broken candidate can never fail a live request.
+    """
+
+    model_version: str
+    primary_decision: Decision
+    risk_score: float | None
+    decision: Decision | None
+    latency_ms: float
+
+    @property
+    def failed(self) -> bool:
+        return self.decision is None
+
+    @property
+    def agrees(self) -> bool:
+        return self.decision == self.primary_decision
+
+
 class RiskEngine:
     def __init__(
         self,
@@ -26,6 +57,7 @@ class RiskEngine:
         model: LogisticBaseline | None = None,
         store: VelocityBackend | None = None,
         rules: tuple[Rule, ...] = DEFAULT_RULES,
+        shadow_model: LogisticBaseline | None = None,
     ) -> None:
         self.settings = settings or Settings()
         self.store = store if store is not None else build_velocity_store(self.settings)
@@ -35,6 +67,16 @@ class RiskEngine:
         if self.model is None and self.settings.model_path:
             self.model = LogisticBaseline.load(self.settings.model_path)
             log.info("Loaded model %s from %s", self.model.version, self.settings.model_path)
+        self.shadow_model = shadow_model
+        if self.shadow_model is None and self.settings.shadow_model_path:
+            # Fail fast on a bad artifact at startup (caught by readiness during a rollout)
+            # rather than silently running without the comparison the operator asked for.
+            self.shadow_model = LogisticBaseline.load(self.settings.shadow_model_path)
+            log.info(
+                "Loaded shadow model %s from %s",
+                self.shadow_model.version,
+                self.settings.shadow_model_path,
+            )
 
     @property
     def mode(self) -> str:
@@ -45,6 +87,12 @@ class RiskEngine:
         base = f"rules-v{__version__}"
         return f"{base}+lr-{self.model.version}" if self.model else base
 
+    @property
+    def shadow_model_version(self) -> str | None:
+        if self.shadow_model is None:
+            return None
+        return f"rules-v{__version__}+lr-{self.shadow_model.version}"
+
     def decide(self, score: float) -> Decision:
         if score >= self.settings.block_threshold:
             return Decision.BLOCK
@@ -53,6 +101,12 @@ class RiskEngine:
         return Decision.APPROVE
 
     def score(self, txn: Transaction | Mapping[str, Any], update_state: bool = True) -> RiskResult:
+        return self.score_with_shadow(txn, update_state=update_state)[0]
+
+    def score_with_shadow(
+        self, txn: Transaction | Mapping[str, Any], update_state: bool = True
+    ) -> tuple[RiskResult, ShadowResult | None]:
+        """Score a transaction; also return the shadow model's verdict when one is loaded."""
         start = time.perf_counter()
         data: Mapping[str, Any] = txn.model_dump() if isinstance(txn, Transaction) else txn
 
@@ -84,7 +138,7 @@ class RiskEngine:
                 data["nameOrig"], data["nameDest"], int(data["step"]), float(data["amount"])
             )
 
-        return RiskResult(
+        result = RiskResult(
             transaction_id=data.get("transaction_id"),
             risk_score=risk,
             decision=self.decide(risk),
@@ -96,5 +150,34 @@ class RiskEngine:
             ],
             top_features=top,
             model_version=self.model_version,
+            latency_ms=round((time.perf_counter() - start) * 1000, 3),
+        )
+        shadow = None
+        if self.shadow_model is not None:
+            shadow = self._score_shadow(self.shadow_model, features, rules_score, result.decision)
+        return result, shadow
+
+    def _score_shadow(
+        self,
+        shadow_model: LogisticBaseline,
+        features: Mapping[str, float],
+        rules_score: float,
+        primary_decision: Decision,
+    ) -> ShadowResult:
+        start = time.perf_counter()
+        version = f"rules-v{__version__}+lr-{shadow_model.version}"
+        try:
+            p = shadow_model.predict_proba(features)
+            if not math.isfinite(p):
+                raise ValueError(f"shadow model returned non-finite probability {p!r}")
+            risk: float | None = blend_risk(p, rules_score, self.settings.model_weight)
+        except Exception:  # a shadow candidate must never fail a live request
+            log.exception("Shadow model %s failed; primary result unaffected", version)
+            risk = None
+        return ShadowResult(
+            model_version=version,
+            primary_decision=primary_decision,
+            risk_score=risk,
+            decision=None if risk is None else self.decide(risk),
             latency_ms=round((time.perf_counter() - start) * 1000, 3),
         )

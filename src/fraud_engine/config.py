@@ -41,6 +41,10 @@ class Settings:
             monitoring. When set, ``/metrics`` exports ``fre_score_psi``.
         drift_window: number of most recent live scores compared with the reference.
         drift_min_samples: live scores needed before PSI is reported.
+        shadow_model_path: optional path to a candidate model artifact scored in *shadow*
+            mode: it sees exactly the same point-in-time features as the primary path,
+            but its score never changes the API response, the decision or the velocity
+            state. Only aggregate agreement metrics are exported.
     """
 
     review_threshold: float = 0.5
@@ -57,6 +61,7 @@ class Settings:
     score_reference_path: str | None = None
     drift_window: int = 5000
     drift_min_samples: int = 500
+    shadow_model_path: str | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -91,4 +96,5 @@ class Settings:
             score_reference_path=os.getenv("FRE_SCORE_REFERENCE_PATH") or None,
             drift_window=_int("FRE_DRIFT_WINDOW", 5000),
             drift_min_samples=_int("FRE_DRIFT_MIN_SAMPLES", 500),
+            shadow_model_path=os.getenv("FRE_SHADOW_MODEL_PATH") or None,
         )
