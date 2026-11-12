@@ -87,6 +87,9 @@ Every response carries an `x-request-id` header. The API echoes yours or generat
 | `fre_risk_score` | histogram (0.1 … 1.0) | Distribution of final risk scores |
 | `fre_score_psi` | gauge | PSI of the last `FRE_DRIFT_WINDOW` scores vs the training score reference (only with `FRE_SCORE_REFERENCE_PATH`, once `FRE_DRIFT_MIN_SAMPLES` scores are in) |
 | `fre_score_drift_window_count` | gauge | Live scores currently in the drift window |
+| `fre_feature_psi{feature}` | gauge | PSI of each model input over the last `FRE_DRIFT_WINDOW` transactions vs the training feature reference (only with `FRE_FEATURE_REFERENCE_PATH`, once warm) |
+| `fre_feature_drift_window_count` | gauge | Feature vectors currently in the feature drift window |
+| `fre_feature_drift_skipped_total` | counter | Feature vectors skipped because a value was non-finite |
 | `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
 | `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
 | `fre_shadow_disagreements_total{primary,shadow}` | counter | Live vs shadow decision mismatches |
@@ -128,6 +131,36 @@ FRE_SCORE_REFERENCE_PATH=models/baseline.score_reference.json make run
 The window is per replica. Use the reference built with the same `FRE_MODEL_WEIGHT` you
 serve, and retrain the reference whenever the model changes; a bad reference file stops
 the API at startup rather than reporting nonsense.
+
+### Feature drift (PSI per input)
+
+Score PSI tells you *that* the distribution moved; feature PSI tells you *which input*
+moved. Training also writes `models/baseline.feature_reference.json`: decile cut points
+and bin shares for every feature in `FEATURE_NAMES`, from the same train-window tail
+(label-free, point-in-time features, never the test window). Binary features collapse to
+two or three bins; live values beyond the training range land in the last bin.
+
+```bash
+FRE_MODEL_PATH=models/baseline.json \
+FRE_SCORE_REFERENCE_PATH=models/baseline.score_reference.json \
+FRE_FEATURE_REFERENCE_PATH=models/baseline.feature_reference.json make run
+```
+
+`fre_feature_psi{feature="log_amount"}` (one series per model input, fixed label set)
+uses the same window and warm-up as score PSI. Investigate the top movers when the score
+alert fires:
+
+```yaml
+- alert: FraudFeatureDrift
+  expr: max by (feature) (fre_feature_psi) > 0.25
+  for: 1h
+  labels: {severity: info}
+  annotations:
+    summary: "Model input {{ $labels.feature }} has drifted from the training window"
+```
+
+Feature references work in rules-only mode too (the features are computed either way).
+A reference whose feature set differs from the serving code stops the API at startup.
 
 ### Request
 
@@ -320,6 +353,7 @@ make lint typecheck
 | `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
 | `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
 | `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
+| `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
 
@@ -367,8 +401,9 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL for the `redis` backend |
 | `FRE_REDIS_KEY_PREFIX` | `fre:velocity` | Namespace for velocity keys in Redis |
 | `FRE_SCORE_REFERENCE_PATH` | unset | Training score reference; enables `fre_score_psi` |
-| `FRE_DRIFT_WINDOW` | `5000` | Live scores in the rolling PSI window |
-| `FRE_DRIFT_MIN_SAMPLES` | `500` | Scores needed before PSI is reported |
+| `FRE_FEATURE_REFERENCE_PATH` | unset | Training per-feature reference; enables `fre_feature_psi` |
+| `FRE_DRIFT_WINDOW` | `5000` | Live scores / feature vectors in the rolling PSI windows |
+| `FRE_DRIFT_MIN_SAMPLES` | `500` | Observations needed before PSI is reported |
 | `FRE_SHADOW_MODEL_PATH` | unset | Candidate model scored in shadow mode: same features, never affects the response; compared via `fre_shadow_*` metrics |
 | `PORT` | `8000` | Container listen port |
 
@@ -390,6 +425,7 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── schemas.py         Pydantic request/response models
 │   ├── metrics.py         Prometheus-format metrics
 │   ├── drift.py           Score reference + rolling PSI drift monitor
+│   ├── feature_drift.py   Per-feature quantile reference + rolling feature PSI
 │   └── config.py          FRE_* settings
 ├── tests/                 Unit, leakage and API tests
 ├── docs/                  Dataset, leakage plan, architecture, CI/CD
@@ -407,7 +443,8 @@ are in [docs/cicd.md](docs/cicd.md).
 - [ ] Kafka consumer mode for streaming ingestion
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
 - [x] Drift detection: PSI of live score distribution vs the training window (`fre_score_psi`, example alert rule)
-- [ ] Feature-level drift (PSI per input feature) and label-delayed performance monitoring
+- [x] Feature-level drift: PSI per input feature (`FRE_FEATURE_REFERENCE_PATH`, `fre_feature_psi{feature}`)
+- [ ] Label-delayed performance monitoring
 - [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
 - [ ] Delayed-label feedback loop
 

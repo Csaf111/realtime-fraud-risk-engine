@@ -39,8 +39,12 @@ class Settings:
         redis_key_prefix: namespace for velocity keys in Redis.
         score_reference_path: optional training-time score reference (JSON) for drift
             monitoring. When set, ``/metrics`` exports ``fre_score_psi``.
-        drift_window: number of most recent live scores compared with the reference.
-        drift_min_samples: live scores needed before PSI is reported.
+        feature_reference_path: optional training-time per-feature reference (JSON).
+            When set, ``/metrics`` exports ``fre_feature_psi{feature=...}`` for every
+            model input.
+        drift_window: number of most recent live scores (and feature vectors) compared
+            with the references.
+        drift_min_samples: live observations needed before PSI is reported.
         shadow_model_path: optional path to a candidate model artifact scored in *shadow*
             mode: it sees exactly the same point-in-time features as the primary path,
             but its score never changes the API response, the decision or the velocity
@@ -59,6 +63,7 @@ class Settings:
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "fre:velocity"
     score_reference_path: str | None = None
+    feature_reference_path: str | None = None
     drift_window: int = 5000
     drift_min_samples: int = 500
     shadow_model_path: str | None = None
@@ -94,6 +99,7 @@ class Settings:
             redis_url=os.getenv("FRE_REDIS_URL") or "redis://localhost:6379/0",
             redis_key_prefix=os.getenv("FRE_REDIS_KEY_PREFIX") or "fre:velocity",
             score_reference_path=os.getenv("FRE_SCORE_REFERENCE_PATH") or None,
+            feature_reference_path=os.getenv("FRE_FEATURE_REFERENCE_PATH") or None,
             drift_window=_int("FRE_DRIFT_WINDOW", 5000),
             drift_min_samples=_int("FRE_DRIFT_MIN_SAMPLES", 500),
             shadow_model_path=os.getenv("FRE_SHADOW_MODEL_PATH") or None,

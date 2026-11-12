@@ -126,4 +126,4 @@ flowchart LR
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
-| Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI vs training reference | Feature-level drift, delayed-label precision/recall |
+| Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |

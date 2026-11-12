@@ -19,7 +19,11 @@ leaking customer data into the monitoring stack.
 
 When a :class:`~fraud_engine.drift.DriftMonitor` is attached (``FRE_SCORE_REFERENCE_PATH``),
 ``fre_score_psi`` reports the PSI of the last ``FRE_DRIFT_WINDOW`` scores against the
-training-time score reference.
+training-time score reference. When a
+:class:`~fraud_engine.feature_drift.FeatureDriftMonitor` is attached
+(``FRE_FEATURE_REFERENCE_PATH``), ``fre_feature_psi{feature="..."}`` reports one PSI per model
+input, so a score shift can be traced to the input that moved. Its labels are the fixed
+``FEATURE_NAMES``, never values.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from collections import Counter
 from collections.abc import Iterable
 
 from .drift import SCORE_BUCKETS, DriftMonitor
+from .feature_drift import FeatureDriftMonitor
 
 __all__ = ["SCORE_BUCKETS", "Metrics"]
 
@@ -36,8 +41,13 @@ _BUCKETS_MS = (1, 2, 5, 10, 25, 50, 100, 250)
 
 
 class Metrics:
-    def __init__(self, drift: DriftMonitor | None = None) -> None:
+    def __init__(
+        self,
+        drift: DriftMonitor | None = None,
+        feature_drift: FeatureDriftMonitor | None = None,
+    ) -> None:
         self.drift = drift
+        self.feature_drift = feature_drift
         self._lock = threading.Lock()
         self.decisions: Counter[str] = Counter()
         self.requests: Counter[str] = Counter()
@@ -162,6 +172,8 @@ class Metrics:
             ]
             if self.drift is not None:
                 lines += self._render_drift(self.drift)
+            if self.feature_drift is not None:
+                lines += self._render_feature_drift(self.feature_drift)
             if self.shadow_scored or self.shadow_errors:
                 lines += self._render_shadow()
         return "\n".join(lines) + "\n"
@@ -213,4 +225,23 @@ class Metrics:
                 "# TYPE fre_score_psi gauge",
                 f"fre_score_psi {value:.6f}",
             ]
+        return lines
+
+    @staticmethod
+    def _render_feature_drift(fd: FeatureDriftMonitor) -> list[str]:
+        lines = [
+            "# HELP fre_feature_drift_window_count Feature vectors in the feature drift window.",
+            "# TYPE fre_feature_drift_window_count gauge",
+            f"fre_feature_drift_window_count {fd.count}",
+            "# HELP fre_feature_drift_skipped_total Feature vectors skipped (non-finite values).",
+            "# TYPE fre_feature_drift_skipped_total counter",
+            f"fre_feature_drift_skipped_total {fd.skipped}",
+        ]
+        values = fd.psi()
+        if values is not None:  # omitted until min_samples observations have been seen
+            lines += [
+                "# HELP fre_feature_psi PSI of each live model input vs the training reference.",
+                "# TYPE fre_feature_psi gauge",
+            ]
+            lines += [f'fre_feature_psi{{feature="{k}"}} {v:.6f}' for k, v in values.items()]
         return lines
