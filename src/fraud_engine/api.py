@@ -17,6 +17,7 @@ from .config import Settings
 from .drift import DriftMonitor, ScoreReference
 from .feature_drift import FeatureDriftMonitor, FeatureReference
 from .metrics import Metrics
+from .preauth import PreAuthTransaction, score_preauth
 from .schemas import BatchRequest, BatchResponse, RiskResult, Transaction
 from .scoring import RiskEngine, ShadowResult
 
@@ -137,6 +138,24 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
             _observe(m, r, shadow)
             results.append(r)
         return BatchResponse(results=results, count=len(results))
+
+    @app.post("/v2/score", response_model=RiskResult, tags=["scoring"])
+    def score_v2(txn: PreAuthTransaction, request: Request) -> RiskResult:
+        """Pre-authorisation rules-only baseline; no post-event balance fields."""
+        eng: RiskEngine = request.app.state.engine
+        m: Metrics = request.app.state.metrics
+        m.request("score_v2")
+        velocity = eng.store.snapshot(txn.nameOrig, txn.nameDest, txn.step)
+        result = score_preauth(
+            txn,
+            velocity,
+            review_threshold=settings.review_threshold,
+            block_threshold=settings.block_threshold,
+            high_amount_threshold=settings.high_amount_threshold,
+        )
+        eng.store.record(txn.nameOrig, txn.nameDest, txn.step, txn.amount)
+        _observe(m, result)
+        return result
 
     @app.get("/v1/rules", tags=["explainability"])
     def list_rules(request: Request) -> list[dict[str, object]]:
