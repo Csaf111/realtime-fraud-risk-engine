@@ -15,6 +15,7 @@ from fastapi.responses import PlainTextResponse
 from . import __version__
 from .config import Settings
 from .drift import DriftMonitor, ScoreReference
+from .feature_drift import FeatureDriftMonitor, FeatureReference
 from .metrics import Metrics
 from .schemas import BatchRequest, BatchResponse, RiskResult, Transaction
 from .scoring import RiskEngine, ShadowResult
@@ -47,13 +48,23 @@ def _drift_monitor(settings: Settings) -> DriftMonitor | None:
     return DriftMonitor(reference, settings.drift_window, settings.drift_min_samples)
 
 
+def _feature_drift_monitor(settings: Settings) -> FeatureDriftMonitor | None:
+    if not settings.feature_reference_path:
+        return None
+    reference = FeatureReference.load(settings.feature_reference_path)
+    return FeatureDriftMonitor(reference, settings.drift_window, settings.drift_min_samples)
+
+
 def create_app(settings: Settings | None = None, engine: RiskEngine | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        feature_drift = _feature_drift_monitor(settings)
         app.state.engine = engine or RiskEngine(settings)
-        app.state.metrics = Metrics(drift=_drift_monitor(settings))
+        if feature_drift is not None:
+            app.state.engine.feature_observer = feature_drift.observe
+        app.state.metrics = Metrics(drift=_drift_monitor(settings), feature_drift=feature_drift)
         log.info(
             "Engine ready: mode=%s version=%s env=%s",
             app.state.engine.mode,
@@ -91,6 +102,9 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
             "model_version": eng.model_version,
             "environment": settings.environment,
             "drift_reference": "loaded" if request.app.state.metrics.drift else "none",
+            "feature_drift_reference": (
+                "loaded" if request.app.state.metrics.feature_drift else "none"
+            ),
         }
         if eng.shadow_model_version is not None:
             body["shadow_model_version"] = eng.shadow_model_version

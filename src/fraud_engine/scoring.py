@@ -4,6 +4,10 @@ Optionally a *shadow* model is scored next to the primary path. It receives exac
 same point-in-time features and rules score (computed once, before the event is recorded
 in the velocity store), so a shadow comparison has online/offline parity by construction.
 The shadow result never reaches the API response, the decision or the velocity state.
+
+An optional ``feature_observer`` receives the same point-in-time feature dict (for example
+a :class:`~fraud_engine.feature_drift.FeatureDriftMonitor`). It is observe-only: it cannot
+change the score, and an exception in it is logged and swallowed.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,7 +62,9 @@ class RiskEngine:
         store: VelocityBackend | None = None,
         rules: tuple[Rule, ...] = DEFAULT_RULES,
         shadow_model: LogisticBaseline | None = None,
+        feature_observer: Callable[[Mapping[str, float]], None] | None = None,
     ) -> None:
+        self.feature_observer = feature_observer
         self.settings = settings or Settings()
         self.store = store if store is not None else build_velocity_store(self.settings)
         self.rules = rules
@@ -113,6 +119,8 @@ class RiskEngine:
         # 1. Point-in-time state BEFORE this event (no self-leakage).
         velocity = self.store.snapshot(data["nameOrig"], data["nameDest"], int(data["step"]))
         features = compute_features(data, velocity)
+        if self.feature_observer is not None:
+            self._observe_features(features)
 
         # 2. Rules.
         rules_score, hits = evaluate_rules(data, velocity, self.rule_ctx, self.rules)
@@ -156,6 +164,13 @@ class RiskEngine:
         if self.shadow_model is not None:
             shadow = self._score_shadow(self.shadow_model, features, rules_score, result.decision)
         return result, shadow
+
+    def _observe_features(self, features: Mapping[str, float]) -> None:
+        assert self.feature_observer is not None
+        try:
+            self.feature_observer(features)
+        except Exception:  # monitoring must never fail a live request
+            log.exception("Feature observer failed; scoring unaffected")
 
     def _score_shadow(
         self,
