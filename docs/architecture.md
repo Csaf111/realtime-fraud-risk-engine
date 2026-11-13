@@ -62,7 +62,7 @@ flowchart TD
     checks -- ok --> scale["fit_standardiser(train only)"]
     scale --> fit["LogisticRegression<br/>class_weight=balanced"]
     fit --> eval["Evaluate on test<br/>model vs rules-only"]
-    eval --> art[("models/baseline.json<br/>+ metrics.json")]
+    eval --> art[("models/baseline.json<br/>+ metrics.json<br/>+ score_reference.json")]
     art -. "FRE_MODEL_PATH" .-> serve["API / container"]
 ```
 
@@ -88,6 +88,22 @@ The model is linear in standardised features. Each feature's log-odds contributi
 not a SHAP-style approximation. Rule hits carry stable codes that analysts can look up via
 `GET /v1/rules`.
 
+### Shadow models
+
+Setting `FRE_SHADOW_MODEL_PATH` loads a second (candidate) artifact that is scored on every
+live request **after** the primary result is built. It reuses the exact feature vector and
+rules score the primary path computed from the pre-event velocity snapshot, so it cannot see
+the current event or anything later, and the event is still recorded in the velocity store
+exactly once. Its score uses the same `blend_risk` and thresholds as the primary path.
+
+The shadow verdict never appears in the response and never changes the decision. It only
+feeds aggregate `fre_shadow_*` metrics (decision counts, a live-vs-shadow disagreement
+matrix, mean absolute score delta, extra latency). Exceptions or non-finite outputs from the
+candidate are logged and counted in `fre_shadow_errors_total`; the request still succeeds.
+A malformed shadow artifact fails startup, so a bad rollout is caught by readiness rather
+than silently running without the comparison. The streaming consumer scores without a
+shadow comparison for now.
+
 ## 5. CI/CD and branch promotion
 
 ```mermaid
@@ -110,4 +126,4 @@ flowchart LR
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
-| Monitoring | Counters + latency histogram | Score-distribution drift, alert rate, per-rule hit rate |
+| Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |

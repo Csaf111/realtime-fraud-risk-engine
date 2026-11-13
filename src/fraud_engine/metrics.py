@@ -9,9 +9,24 @@ raw material for drift detection:
 * ``fre_risk_score``: a histogram of final risk scores, so the score distribution can be
   compared over time (for example a PSI against the training window) in Prometheus/Grafana.
 
-Only rule codes and scores are recorded. Nothing about the transaction itself (accounts,
+When a shadow model is configured (``FRE_SHADOW_MODEL_PATH``), ``fre_shadow_*`` series
+compare what the candidate *would* have decided against the live decision, so a new model
+can be judged on real traffic before it is promoted.
+
+Only rule codes, decisions and scores are recorded. Nothing about the transaction itself (accounts,
 amounts) is ever exported as a label, which keeps metric cardinality bounded and avoids
 leaking customer data into the monitoring stack.
+
+When a :class:`~fraud_engine.drift.DriftMonitor` is attached (``FRE_SCORE_REFERENCE_PATH``),
+``fre_score_psi`` reports the PSI of the last ``FRE_DRIFT_WINDOW`` scores against the
+training-time score reference. When a
+:class:`~fraud_engine.feature_drift.FeatureDriftMonitor` is attached
+(``FRE_FEATURE_REFERENCE_PATH``), ``fre_feature_psi{feature="..."}`` reports one PSI per model
+input, so a score shift can be traced to the input that moved. Its labels are the fixed
+``FEATURE_NAMES``, never values.
+
+When an :class:`~fraud_engine.outcomes.OutcomeTracker` is attached, ``fre_label_*`` series
+report how served decisions fared once their delayed fraud labels arrived.
 """
 
 from __future__ import annotations
@@ -20,12 +35,25 @@ import threading
 from collections import Counter
 from collections.abc import Iterable
 
+from .drift import SCORE_BUCKETS, DriftMonitor
+from .feature_drift import FeatureDriftMonitor
+from .outcomes import OutcomeTracker
+
+__all__ = ["SCORE_BUCKETS", "Metrics"]
+
 _BUCKETS_MS = (1, 2, 5, 10, 25, 50, 100, 250)
-SCORE_BUCKETS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
 
 
 class Metrics:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        drift: DriftMonitor | None = None,
+        feature_drift: FeatureDriftMonitor | None = None,
+        outcomes: OutcomeTracker | None = None,
+    ) -> None:
+        self.drift = drift
+        self.outcomes = outcomes
+        self.feature_drift = feature_drift
         self._lock = threading.Lock()
         self.decisions: Counter[str] = Counter()
         self.requests: Counter[str] = Counter()
@@ -36,6 +64,12 @@ class Metrics:
         self.score_buckets: Counter[float] = Counter()
         self.score_sum = 0.0
         self.score_count = 0
+        self.shadow_scored = 0
+        self.shadow_errors = 0
+        self.shadow_decisions: Counter[str] = Counter()
+        self.shadow_disagreements: Counter[tuple[str, str]] = Counter()
+        self.shadow_abs_delta_sum = 0.0
+        self.shadow_latency_sum = 0.0
 
     def observe(
         self,
@@ -59,11 +93,33 @@ class Metrics:
                 for sb in SCORE_BUCKETS:
                     if risk_score <= sb:
                         self.score_buckets[sb] += 1
+                if self.drift is not None:
+                    self.drift.observe(risk_score)
             self.latency_sum += latency_ms
             self.latency_count += 1
             for b in _BUCKETS_MS:
                 if latency_ms <= b:
                     self.latency_buckets[b] += 1
+
+    def observe_shadow(
+        self,
+        primary_decision: str,
+        primary_score: float,
+        shadow_decision: str | None,
+        shadow_score: float | None,
+        latency_ms: float,
+    ) -> None:
+        """Record one shadow comparison. ``shadow_decision`` is ``None`` if the shadow failed."""
+        with self._lock:
+            self.shadow_latency_sum += latency_ms
+            if shadow_decision is None or shadow_score is None:
+                self.shadow_errors += 1
+                return
+            self.shadow_scored += 1
+            self.shadow_decisions[shadow_decision] += 1
+            self.shadow_abs_delta_sum += abs(shadow_score - primary_score)
+            if shadow_decision != primary_decision:
+                self.shadow_disagreements[(primary_decision, shadow_decision)] += 1
 
     def request(self, endpoint: str) -> None:
         with self._lock:
@@ -120,4 +176,80 @@ class Metrics:
                 f"fre_risk_score_sum {self.score_sum:.6f}",
                 f"fre_risk_score_count {self.score_count}",
             ]
+            if self.drift is not None:
+                lines += self._render_drift(self.drift)
+            if self.feature_drift is not None:
+                lines += self._render_feature_drift(self.feature_drift)
+            if self.shadow_scored or self.shadow_errors:
+                lines += self._render_shadow()
+            if self.outcomes is not None and self.outcomes.enabled:
+                lines += self.outcomes.render()
         return "\n".join(lines) + "\n"
+
+    def _render_shadow(self) -> list[str]:
+        lines = [
+            "# HELP fre_shadow_scored_total Transactions the shadow model scored successfully.",
+            "# TYPE fre_shadow_scored_total counter",
+            f"fre_shadow_scored_total {self.shadow_scored}",
+            "# HELP fre_shadow_errors_total Shadow scoring failures (primary unaffected).",
+            "# TYPE fre_shadow_errors_total counter",
+            f"fre_shadow_errors_total {self.shadow_errors}",
+            "# HELP fre_shadow_decisions_total Decisions the shadow model would have made.",
+            "# TYPE fre_shadow_decisions_total counter",
+        ]
+        lines += [
+            f'fre_shadow_decisions_total{{decision="{k}"}} {v}'
+            for k, v in sorted(self.shadow_decisions.items())
+        ]
+        lines += [
+            "# HELP fre_shadow_disagreements_total Live vs shadow decision mismatches.",
+            "# TYPE fre_shadow_disagreements_total counter",
+        ]
+        lines += [
+            f'fre_shadow_disagreements_total{{primary="{p}",shadow="{s}"}} {v}'
+            for (p, s), v in sorted(self.shadow_disagreements.items())
+        ]
+        lines += [
+            "# HELP fre_shadow_abs_score_delta_sum Sum of |shadow - live| risk score.",
+            "# TYPE fre_shadow_abs_score_delta_sum counter",
+            f"fre_shadow_abs_score_delta_sum {self.shadow_abs_delta_sum:.6f}",
+            "# HELP fre_shadow_latency_ms_sum Total extra latency spent on shadow scoring.",
+            "# TYPE fre_shadow_latency_ms_sum counter",
+            f"fre_shadow_latency_ms_sum {self.shadow_latency_sum:.3f}",
+        ]
+        return lines
+
+    @staticmethod
+    def _render_drift(drift: DriftMonitor) -> list[str]:
+        lines = [
+            "# HELP fre_score_drift_window_count Live scores in the drift window.",
+            "# TYPE fre_score_drift_window_count gauge",
+            f"fre_score_drift_window_count {drift.count}",
+        ]
+        value = drift.psi()
+        if value is not None:  # omitted until min_samples scores have been seen
+            lines += [
+                "# HELP fre_score_psi PSI of live risk scores vs the training score reference.",
+                "# TYPE fre_score_psi gauge",
+                f"fre_score_psi {value:.6f}",
+            ]
+        return lines
+
+    @staticmethod
+    def _render_feature_drift(fd: FeatureDriftMonitor) -> list[str]:
+        lines = [
+            "# HELP fre_feature_drift_window_count Feature vectors in the feature drift window.",
+            "# TYPE fre_feature_drift_window_count gauge",
+            f"fre_feature_drift_window_count {fd.count}",
+            "# HELP fre_feature_drift_skipped_total Feature vectors skipped (non-finite values).",
+            "# TYPE fre_feature_drift_skipped_total counter",
+            f"fre_feature_drift_skipped_total {fd.skipped}",
+        ]
+        values = fd.psi()
+        if values is not None:  # omitted until min_samples observations have been seen
+            lines += [
+                "# HELP fre_feature_psi PSI of each live model input vs the training reference.",
+                "# TYPE fre_feature_psi gauge",
+            ]
+            lines += [f'fre_feature_psi{{feature="{k}"}} {v:.6f}' for k, v in values.items()]
+        return lines

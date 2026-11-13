@@ -69,6 +69,7 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 |---|---|---|
 | `POST` | `/v1/score` | Score one transaction |
 | `POST` | `/v1/score/batch` | Score up to `FRE_MAX_BATCH_SIZE` transactions **in order** |
+| `POST` | `/v1/labels` | Report delayed fraud labels for scored transactions (monitoring only) |
 | `GET` | `/v1/rules` | The rulebook (code, description, points) |
 | `GET` | `/health` | Liveness |
 | `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version |
@@ -85,12 +86,119 @@ Every response carries an `x-request-id` header. The API echoes yours or generat
 | `fre_scored_total` | counter | Transactions scored (denominator for hit rates) |
 | `fre_rule_hits_total{rule="R00x"}` | counter | Times each rule fired |
 | `fre_risk_score` | histogram (0.1 … 1.0) | Distribution of final risk scores |
+| `fre_score_psi` | gauge | PSI of the last `FRE_DRIFT_WINDOW` scores vs the training score reference (only with `FRE_SCORE_REFERENCE_PATH`, once `FRE_DRIFT_MIN_SAMPLES` scores are in) |
+| `fre_score_drift_window_count` | gauge | Live scores currently in the drift window |
+| `fre_feature_psi{feature}` | gauge | PSI of each model input over the last `FRE_DRIFT_WINDOW` transactions vs the training feature reference (only with `FRE_FEATURE_REFERENCE_PATH`, once warm) |
+| `fre_feature_drift_window_count` | gauge | Feature vectors currently in the feature drift window |
+| `fre_feature_drift_skipped_total` | counter | Feature vectors skipped because a value was non-finite |
+| `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
+| `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
+| `fre_shadow_disagreements_total{primary,shadow}` | counter | Live vs shadow decision mismatches |
+| `fre_shadow_abs_score_delta_sum`, `fre_shadow_latency_ms_sum` | counter | Score gap and extra latency, for averages |
+| `fre_labels_received_total{status}` | counter | Delayed labels by join result: `matched`, `unknown`, `duplicate` |
+| `fre_labelled_outcomes_total{decision,label}` | counter | Served decisions joined to their label (`fraud` / `legit`) |
+| `fre_label_precision{level}`, `fre_label_recall{level}` | gauge | Rolling precision / recall over the last `FRE_LABEL_WINDOW` labelled outcomes; `level="alert"` (REVIEW or BLOCK) and `level="block"` |
+| `fre_label_pending`, `fre_label_pending_evicted_total`, `fre_label_window_count` | gauge / counter | Decisions awaiting a label, those dropped unlabelled, labelled outcomes in the window |
 
 Per-rule hit rate in PromQL:
 `rate(fre_rule_hits_total[1h]) / ignoring(rule) group_left rate(fre_scored_total[1h])`.
 A jump in one rule's hit rate, or a shift in the score histogram, is the earliest signal of
 upstream data changes or a new attack pattern. Labels carry only rule codes, never account
 names or amounts.
+
+Shadow disagreement rate in PromQL:
+`sum(rate(fre_shadow_disagreements_total[1h])) / rate(fre_shadow_scored_total[1h])`.
+Watch the `primary="APPROVE",shadow="BLOCK"` cell before promoting a candidate model.
+
+### Score drift (PSI)
+
+Training writes `models/baseline.score_reference.json`: the share of served scores in each
+histogram bin on the most recent `--validation-frac` of the training window, computed with
+`--model-weight` (label-free, never the test window). Serve it alongside the model:
+
+```bash
+FRE_MODEL_PATH=models/baseline.json \
+FRE_SCORE_REFERENCE_PATH=models/baseline.score_reference.json make run
+```
+
+`fre_score_psi` then compares a rolling window of live scores with that reference
+(PSI < 0.1 stable, 0.1–0.25 moderate, > 0.25 significant). A Prometheus alert:
+
+```yaml
+- alert: FraudScoreDrift
+  expr: max(fre_score_psi) > 0.25
+  for: 30m
+  labels: {severity: warning}
+  annotations:
+    summary: "Live fraud score distribution has drifted from the training window"
+```
+
+The window is per replica. Use the reference built with the same `FRE_MODEL_WEIGHT` you
+serve, and retrain the reference whenever the model changes; a bad reference file stops
+the API at startup rather than reporting nonsense.
+
+### Feature drift (PSI per input)
+
+Score PSI tells you *that* the distribution moved; feature PSI tells you *which input*
+moved. Training also writes `models/baseline.feature_reference.json`: decile cut points
+and bin shares for every feature in `FEATURE_NAMES`, from the same train-window tail
+(label-free, point-in-time features, never the test window). Binary features collapse to
+two or three bins; live values beyond the training range land in the last bin.
+
+```bash
+FRE_MODEL_PATH=models/baseline.json \
+FRE_SCORE_REFERENCE_PATH=models/baseline.score_reference.json \
+FRE_FEATURE_REFERENCE_PATH=models/baseline.feature_reference.json make run
+```
+
+`fre_feature_psi{feature="log_amount"}` (one series per model input, fixed label set)
+uses the same window and warm-up as score PSI. Investigate the top movers when the score
+alert fires:
+
+```yaml
+- alert: FraudFeatureDrift
+  expr: max by (feature) (fre_feature_psi) > 0.25
+  for: 1h
+  labels: {severity: info}
+  annotations:
+    summary: "Model input {{ $labels.feature }} has drifted from the training window"
+```
+
+Feature references work in rules-only mode too (the features are computed either way).
+A reference whose feature set differs from the serving code stops the API at startup.
+
+### Delayed-label performance monitoring
+
+Drift says the inputs moved; labels say whether the engine still catches fraud. Chargebacks
+and analyst verdicts arrive late, so post them back by `transaction_id` whenever they land:
+
+```bash
+curl -s localhost:8000/v1/labels -H 'content-type: application/json' \
+  -d '{"labels": [{"transaction_id": "demo-fraud-001", "is_fraud": true}]}'
+# {"matched": 1, "unknown": 0, "duplicate": 0}
+```
+
+Each replica keeps up to `FRE_LABEL_PENDING_CAPACITY` served decisions (score and decision
+only, no transaction data) for transactions that carried a `transaction_id`. A label joins
+to that decision, and `fre_label_precision` / `fre_label_recall` report rolling performance
+over the last `FRE_LABEL_WINDOW` labelled outcomes. What-if batch scores
+(`update_state=false`) are not tracked; labels for unknown or evicted ids count as
+`unknown`, retries as `duplicate`, and neither is double-counted. Precision and recall are
+omitted until defined. A recall alert:
+
+```yaml
+- alert: FraudRecallDrop
+  expr: min(fre_label_recall{level="alert"}) < 0.5 and min(fre_label_window_count) > 200
+  for: 6h
+  labels: {severity: warning}
+  annotations:
+    summary: "Labelled recall of REVIEW+BLOCK has dropped"
+```
+
+Labels are used **only** for these metrics: they never reach features, rules, the model or
+the velocity store, so posting one cannot change a later score (tested). State is per
+replica: send labels to the replica that scored the transaction, or sum
+`fre_labelled_outcomes_total` across replicas in Prometheus to compute cluster-wide rates.
 
 ### Request
 
@@ -282,6 +390,9 @@ make lint typecheck
 | `test_api.py` | All endpoints, validation, label rejection, batch limits, metrics |
 | `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
 | `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
+| `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
+| `test_outcomes.py` | Delayed-label join: matched/unknown/duplicate, bounded buffers, rolling precision/recall, `/v1/labels`, labels never change later scores |
+| `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
 
@@ -328,6 +439,13 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_VELOCITY_BACKEND` | `memory` | `memory` (per process) or `redis` (shared across replicas; needs the `redis` extra) |
 | `FRE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL for the `redis` backend |
 | `FRE_REDIS_KEY_PREFIX` | `fre:velocity` | Namespace for velocity keys in Redis |
+| `FRE_SCORE_REFERENCE_PATH` | unset | Training score reference; enables `fre_score_psi` |
+| `FRE_FEATURE_REFERENCE_PATH` | unset | Training per-feature reference; enables `fre_feature_psi` |
+| `FRE_DRIFT_WINDOW` | `5000` | Live scores / feature vectors in the rolling PSI windows |
+| `FRE_DRIFT_MIN_SAMPLES` | `500` | Observations needed before PSI is reported |
+| `FRE_SHADOW_MODEL_PATH` | unset | Candidate model scored in shadow mode: same features, never affects the response; compared via `fre_shadow_*` metrics |
+| `FRE_LABEL_PENDING_CAPACITY` | `100000` | Served decisions kept awaiting a delayed label (`0` disables `/v1/labels`) |
+| `FRE_LABEL_WINDOW` | `5000` | Labelled outcomes in the rolling precision/recall window |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -347,6 +465,9 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── synthetic.py       PaySim-shaped generator for CI
 │   ├── schemas.py         Pydantic request/response models
 │   ├── metrics.py         Prometheus-format metrics
+│   ├── drift.py           Score reference + rolling PSI drift monitor
+│   ├── feature_drift.py   Per-feature quantile reference + rolling feature PSI
+│   ├── outcomes.py        Delayed-label join + rolling precision/recall
 │   └── config.py          FRE_* settings
 ├── tests/                 Unit, leakage and API tests
 ├── docs/                  Dataset, leakage plan, architecture, CI/CD
@@ -363,8 +484,11 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
 - [ ] Kafka consumer mode for streaming ingestion
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
-- [ ] Drift detection (PSI of live score distribution vs the training window, alerting)
-- [ ] Delayed-label feedback loop and shadow deployments
+- [x] Drift detection: PSI of live score distribution vs the training window (`fre_score_psi`, example alert rule)
+- [x] Feature-level drift: PSI per input feature (`FRE_FEATURE_REFERENCE_PATH`, `fre_feature_psi{feature}`)
+- [x] Label-delayed performance monitoring (`POST /v1/labels`, `fre_label_precision` / `fre_label_recall`)
+- [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
+- [ ] Delayed-label feedback loop
 
 ## Acknowledgements
 
