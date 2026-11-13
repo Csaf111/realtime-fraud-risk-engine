@@ -69,6 +69,7 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 |---|---|---|
 | `POST` | `/v1/score` | Score one transaction |
 | `POST` | `/v1/score/batch` | Score up to `FRE_MAX_BATCH_SIZE` transactions **in order** |
+| `POST` | `/v1/labels` | Report delayed fraud labels for scored transactions (monitoring only) |
 | `GET` | `/v1/rules` | The rulebook (code, description, points) |
 | `GET` | `/health` | Liveness |
 | `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version |
@@ -94,6 +95,10 @@ Every response carries an `x-request-id` header. The API echoes yours or generat
 | `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
 | `fre_shadow_disagreements_total{primary,shadow}` | counter | Live vs shadow decision mismatches |
 | `fre_shadow_abs_score_delta_sum`, `fre_shadow_latency_ms_sum` | counter | Score gap and extra latency, for averages |
+| `fre_labels_received_total{status}` | counter | Delayed labels by join result: `matched`, `unknown`, `duplicate` |
+| `fre_labelled_outcomes_total{decision,label}` | counter | Served decisions joined to their label (`fraud` / `legit`) |
+| `fre_label_precision{level}`, `fre_label_recall{level}` | gauge | Rolling precision / recall over the last `FRE_LABEL_WINDOW` labelled outcomes; `level="alert"` (REVIEW or BLOCK) and `level="block"` |
+| `fre_label_pending`, `fre_label_pending_evicted_total`, `fre_label_window_count` | gauge / counter | Decisions awaiting a label, those dropped unlabelled, labelled outcomes in the window |
 
 Per-rule hit rate in PromQL:
 `rate(fre_rule_hits_total[1h]) / ignoring(rule) group_left rate(fre_scored_total[1h])`.
@@ -161,6 +166,39 @@ alert fires:
 
 Feature references work in rules-only mode too (the features are computed either way).
 A reference whose feature set differs from the serving code stops the API at startup.
+
+### Delayed-label performance monitoring
+
+Drift says the inputs moved; labels say whether the engine still catches fraud. Chargebacks
+and analyst verdicts arrive late, so post them back by `transaction_id` whenever they land:
+
+```bash
+curl -s localhost:8000/v1/labels -H 'content-type: application/json' \
+  -d '{"labels": [{"transaction_id": "demo-fraud-001", "is_fraud": true}]}'
+# {"matched": 1, "unknown": 0, "duplicate": 0}
+```
+
+Each replica keeps up to `FRE_LABEL_PENDING_CAPACITY` served decisions (score and decision
+only, no transaction data) for transactions that carried a `transaction_id`. A label joins
+to that decision, and `fre_label_precision` / `fre_label_recall` report rolling performance
+over the last `FRE_LABEL_WINDOW` labelled outcomes. What-if batch scores
+(`update_state=false`) are not tracked; labels for unknown or evicted ids count as
+`unknown`, retries as `duplicate`, and neither is double-counted. Precision and recall are
+omitted until defined. A recall alert:
+
+```yaml
+- alert: FraudRecallDrop
+  expr: min(fre_label_recall{level="alert"}) < 0.5 and min(fre_label_window_count) > 200
+  for: 6h
+  labels: {severity: warning}
+  annotations:
+    summary: "Labelled recall of REVIEW+BLOCK has dropped"
+```
+
+Labels are used **only** for these metrics: they never reach features, rules, the model or
+the velocity store, so posting one cannot change a later score (tested). State is per
+replica: send labels to the replica that scored the transaction, or sum
+`fre_labelled_outcomes_total` across replicas in Prometheus to compute cluster-wide rates.
 
 ### Request
 
@@ -353,6 +391,7 @@ make lint typecheck
 | `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
 | `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
 | `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
+| `test_outcomes.py` | Delayed-label join: matched/unknown/duplicate, bounded buffers, rolling precision/recall, `/v1/labels`, labels never change later scores |
 | `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
@@ -405,6 +444,8 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_DRIFT_WINDOW` | `5000` | Live scores / feature vectors in the rolling PSI windows |
 | `FRE_DRIFT_MIN_SAMPLES` | `500` | Observations needed before PSI is reported |
 | `FRE_SHADOW_MODEL_PATH` | unset | Candidate model scored in shadow mode: same features, never affects the response; compared via `fre_shadow_*` metrics |
+| `FRE_LABEL_PENDING_CAPACITY` | `100000` | Served decisions kept awaiting a delayed label (`0` disables `/v1/labels`) |
+| `FRE_LABEL_WINDOW` | `5000` | Labelled outcomes in the rolling precision/recall window |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -426,6 +467,7 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── metrics.py         Prometheus-format metrics
 │   ├── drift.py           Score reference + rolling PSI drift monitor
 │   ├── feature_drift.py   Per-feature quantile reference + rolling feature PSI
+│   ├── outcomes.py        Delayed-label join + rolling precision/recall
 │   └── config.py          FRE_* settings
 ├── tests/                 Unit, leakage and API tests
 ├── docs/                  Dataset, leakage plan, architecture, CI/CD
@@ -444,7 +486,7 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
 - [x] Drift detection: PSI of live score distribution vs the training window (`fre_score_psi`, example alert rule)
 - [x] Feature-level drift: PSI per input feature (`FRE_FEATURE_REFERENCE_PATH`, `fre_feature_psi{feature}`)
-- [ ] Label-delayed performance monitoring
+- [x] Label-delayed performance monitoring (`POST /v1/labels`, `fre_label_precision` / `fre_label_recall`)
 - [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
 - [ ] Delayed-label feedback loop
 
