@@ -25,7 +25,7 @@ def row(step, label, **changes):
 
 
 def test_replay_counts_alerts_and_preserves_stable_ties(tmp_path):
-    path = dataset(tmp_path, [row(1, 1), row(2, 0), row(3, 1), row(4, 0)])
+    path = dataset(tmp_path, [row(1, 1, nameOrig="A1", nameDest="B1"), row(2, 0, nameOrig="A2", nameDest="B2"), row(3, 1, nameOrig="A3", nameDest="B3"), row(4, 0, nameOrig="A4", nameDest="B4")])
     result = replay(path, budgets=(0.25, 0.5))
     assert result["records"] == 4
     assert result["fraud_records"] == 2
