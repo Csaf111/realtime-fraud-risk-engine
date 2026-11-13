@@ -24,6 +24,9 @@ training-time score reference. When a
 (``FRE_FEATURE_REFERENCE_PATH``), ``fre_feature_psi{feature="..."}`` reports one PSI per model
 input, so a score shift can be traced to the input that moved. Its labels are the fixed
 ``FEATURE_NAMES``, never values.
+
+When an :class:`~fraud_engine.outcomes.OutcomeTracker` is attached, ``fre_label_*`` series
+report how served decisions fared once their delayed fraud labels arrived.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from collections.abc import Iterable
 
 from .drift import SCORE_BUCKETS, DriftMonitor
 from .feature_drift import FeatureDriftMonitor
+from .outcomes import OutcomeTracker
 
 __all__ = ["SCORE_BUCKETS", "Metrics"]
 
@@ -45,8 +49,10 @@ class Metrics:
         self,
         drift: DriftMonitor | None = None,
         feature_drift: FeatureDriftMonitor | None = None,
+        outcomes: OutcomeTracker | None = None,
     ) -> None:
         self.drift = drift
+        self.outcomes = outcomes
         self.feature_drift = feature_drift
         self._lock = threading.Lock()
         self.decisions: Counter[str] = Counter()
@@ -176,6 +182,8 @@ class Metrics:
                 lines += self._render_feature_drift(self.feature_drift)
             if self.shadow_scored or self.shadow_errors:
                 lines += self._render_shadow()
+            if self.outcomes is not None and self.outcomes.enabled:
+                lines += self.outcomes.render()
         return "\n".join(lines) + "\n"
 
     def _render_shadow(self) -> list[str]:

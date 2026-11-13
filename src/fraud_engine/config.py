@@ -49,6 +49,9 @@ class Settings:
             mode: it sees exactly the same point-in-time features as the primary path,
             but its score never changes the API response, the decision or the velocity
             state. Only aggregate agreement metrics are exported.
+        label_pending_capacity: served decisions (with a ``transaction_id``) kept in memory
+            awaiting a delayed label via ``POST /v1/labels``. ``0`` disables label tracking.
+        label_window: most recent labelled outcomes used for rolling precision/recall.
     """
 
     review_threshold: float = 0.5
@@ -67,6 +70,8 @@ class Settings:
     drift_window: int = 5000
     drift_min_samples: int = 500
     shadow_model_path: str | None = None
+    label_pending_capacity: int = 100_000
+    label_window: int = 5000
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -83,6 +88,10 @@ class Settings:
             raise ValueError("drift_window must be >= 1")
         if not 1 <= self.drift_min_samples <= self.drift_window:
             raise ValueError("drift_min_samples must be between 1 and drift_window")
+        if self.label_pending_capacity < 0:
+            raise ValueError("label_pending_capacity must be >= 0")
+        if self.label_window < 1:
+            raise ValueError("label_window must be >= 1")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -103,4 +112,6 @@ class Settings:
             drift_window=_int("FRE_DRIFT_WINDOW", 5000),
             drift_min_samples=_int("FRE_DRIFT_MIN_SAMPLES", 500),
             shadow_model_path=os.getenv("FRE_SHADOW_MODEL_PATH") or None,
+            label_pending_capacity=_int("FRE_LABEL_PENDING_CAPACITY", 100_000),
+            label_window=_int("FRE_LABEL_WINDOW", 5000),
         )

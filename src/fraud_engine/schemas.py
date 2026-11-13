@@ -83,3 +83,28 @@ class BatchRequest(BaseModel):
 class BatchResponse(BaseModel):
     results: list[RiskResult]
     count: int
+
+
+class Label(BaseModel):
+    """A delayed fraud outcome for a transaction this engine already scored.
+
+    Labels are used only for performance monitoring (``fre_label_*`` metrics). They are
+    never fed into features, rules, the model or velocity state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_id: str = Field(..., min_length=1, max_length=128)
+    is_fraud: bool
+
+
+class LabelBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    labels: list[Label] = Field(..., min_length=1)
+
+
+class LabelBatchResponse(BaseModel):
+    matched: int
+    unknown: int
+    duplicate: int

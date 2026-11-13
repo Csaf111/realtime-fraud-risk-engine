@@ -17,14 +17,29 @@ from .config import Settings
 from .drift import DriftMonitor, ScoreReference
 from .feature_drift import FeatureDriftMonitor, FeatureReference
 from .metrics import Metrics
-from .schemas import BatchRequest, BatchResponse, RiskResult, Transaction
+from .outcomes import LabelStatus, OutcomeTracker
+from .schemas import (
+    BatchRequest,
+    BatchResponse,
+    LabelBatch,
+    LabelBatchResponse,
+    RiskResult,
+    Transaction,
+)
 from .scoring import RiskEngine, ShadowResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("fraud_engine.api")
 
 
-def _observe(m: Metrics, result: RiskResult, shadow: ShadowResult | None = None) -> None:
+def _observe(
+    m: Metrics,
+    result: RiskResult,
+    shadow: ShadowResult | None = None,
+    served: bool = True,
+) -> None:
+    if served and m.outcomes is not None:
+        m.outcomes.record_decision(result.transaction_id, result.risk_score, result.decision.value)
     m.observe(
         result.decision.value,
         result.latency_ms,
@@ -64,7 +79,11 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         app.state.engine = engine or RiskEngine(settings)
         if feature_drift is not None:
             app.state.engine.feature_observer = feature_drift.observe
-        app.state.metrics = Metrics(drift=_drift_monitor(settings), feature_drift=feature_drift)
+        app.state.metrics = Metrics(
+            drift=_drift_monitor(settings),
+            feature_drift=feature_drift,
+            outcomes=OutcomeTracker(settings.label_pending_capacity, settings.label_window),
+        )
         log.info(
             "Engine ready: mode=%s version=%s env=%s",
             app.state.engine.mode,
@@ -134,9 +153,36 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         results = []
         for t in batch.transactions:
             r, shadow = eng.score_with_shadow(t, update_state=batch.update_state)
-            _observe(m, r, shadow)
+            # What-if scoring (update_state=False) is not a served decision: don't join labels.
+            _observe(m, r, shadow, served=batch.update_state)
             results.append(r)
         return BatchResponse(results=results, count=len(results))
+
+    @app.post("/v1/labels", response_model=LabelBatchResponse, tags=["monitoring"])
+    def post_labels(batch: LabelBatch, request: Request) -> LabelBatchResponse:
+        """Report delayed fraud outcomes for previously scored transactions.
+
+        Labels feed only the ``fre_label_*`` performance metrics. They never change features,
+        rules, the model or velocity state, so they cannot leak into later scores.
+        """
+        if len(batch.labels) > settings.max_batch_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Batch too large: max {settings.max_batch_size} labels",
+            )
+        m: Metrics = request.app.state.metrics
+        m.request("labels")
+        tracker = m.outcomes
+        if tracker is None or not tracker.enabled:
+            raise HTTPException(status_code=404, detail="Label tracking is disabled")
+        counts = {s: 0 for s in LabelStatus}
+        for label in batch.labels:
+            counts[tracker.record_label(label.transaction_id, label.is_fraud)] += 1
+        return LabelBatchResponse(
+            matched=counts[LabelStatus.MATCHED],
+            unknown=counts[LabelStatus.UNKNOWN],
+            duplicate=counts[LabelStatus.DUPLICATE],
+        )
 
     @app.get("/v1/rules", tags=["explainability"])
     def list_rules(request: Request) -> list[dict[str, object]]:
