@@ -1,4 +1,4 @@
-"""Train the explainable logistic-regression baseline.
+"""Train an explainable model: the logistic baseline or gradient-boosted trees.
 
 Examples:
     # Real data (download PaySim first, see docs/dataset-paysim.md)
@@ -9,6 +9,9 @@ Examples:
 
     # Pipeline smoke test on synthetic data (what CI does)
     python -m fraud_engine.train --synthetic 5000 --out models/synthetic.json
+
+    # Gradient-boosted trees with exact TreeSHAP explanations (same features, same split)
+    python -m fraud_engine.train --data data/raw/paysim.csv --model gbt --n-estimators 200
 
     # Recommend thresholds for an alert budget: review <= 1% of traffic, block <= 0.2%
     python -m fraud_engine.train --data data/raw/paysim.csv --review-budget 0.01 \
@@ -25,9 +28,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, precision_score, recall_score, roc_auc_score
+from sklearn.utils.class_weight import compute_sample_weight
 
+from .artifacts import ScoringModel
 from .drift import ScoreReference
 from .feature_drift import FeatureReference
 from .features import FEATURE_NAMES
@@ -42,6 +48,12 @@ from .preprocessing import (
 )
 from .synthetic import write_csv
 from .thresholds import blend_risk, evaluate_thresholds, select_thresholds
+from .trees import GradientBoostedTrees
+
+MODEL_CHOICES = ("logreg", "gbt")
+# Exported trees must reproduce scikit-learn's log-odds to within float rounding.
+EXPORT_PARITY_TOL = 1e-9
+EXPORT_PARITY_ROWS = 1000
 
 
 def _metrics(y: np.ndarray, p: np.ndarray, threshold: float) -> dict[str, float]:
@@ -55,7 +67,7 @@ def _metrics(y: np.ndarray, p: np.ndarray, threshold: float) -> dict[str, float]
     }
 
 
-def _served_scores(model: LogisticBaseline, frame: Any, model_weight: float) -> list[float]:
+def _served_scores(model: ScoringModel, frame: Any, model_weight: float) -> list[float]:
     """Blended risk scores for a feature frame, computed exactly as the API serves them."""
     feats = frame[list(FEATURE_NAMES)].to_dict(orient="records")
     rules = frame["rules_score"].tolist()
@@ -71,13 +83,25 @@ def _validation_slice(train_df: Any, validation_frac: float) -> Any:
     return train_df.iloc[-n_val:]
 
 
+def _check_export_parity(model: GradientBoostedTrees, clf: Any, X: np.ndarray) -> None:
+    """Fail training if the pure-Python export disagrees with scikit-learn."""
+    rows = X[:EXPORT_PARITY_ROWS]
+    expected = clf.decision_function(rows)
+    for vec, want in zip(rows, expected, strict=True):
+        got = model.log_odds(dict(zip(model.feature_names, vec.tolist(), strict=True)))
+        if abs(got - float(want)) > EXPORT_PARITY_TOL * max(1.0, abs(float(want))):
+            raise RuntimeError(
+                f"Exported trees disagree with scikit-learn: {got!r} vs {float(want)!r}"
+            )
+
+
 def reference_path_for(model_path: str | Path) -> Path:
     """Where the score reference for a model artifact is written."""
     return Path(model_path).with_suffix(".score_reference.json")
 
 
 def _score_reference(
-    model: LogisticBaseline, train_df: Any, validation_frac: float, model_weight: float
+    model: ScoringModel, train_df: Any, validation_frac: float, model_weight: float
 ) -> ScoreReference:
     """Served-score distribution on the most recent slice of the training window.
 
@@ -98,7 +122,7 @@ def feature_reference_path_for(model_path: str | Path) -> Path:
 
 
 def _feature_reference(
-    model: LogisticBaseline, train_df: Any, validation_frac: float
+    model: ScoringModel, train_df: Any, validation_frac: float
 ) -> FeatureReference:
     """Per-feature distributions on the most recent slice of the training window.
 
@@ -115,7 +139,7 @@ def _feature_reference(
 
 
 def _alert_budget(
-    model: LogisticBaseline,
+    model: ScoringModel,
     train_df: Any,
     test_df: Any,
     review_budget: float,
@@ -159,7 +183,14 @@ def train(
     block_budget: float | None = None,
     validation_frac: float = 0.2,
     model_weight: float = 0.6,
+    model_type: str = "logreg",
+    n_estimators: int = 100,
+    max_depth: int = 3,
+    learning_rate: float = 0.1,
+    random_state: int = 0,
 ) -> dict[str, Any]:
+    if model_type not in MODEL_CHOICES:
+        raise ValueError(f"model_type must be one of {MODEL_CHOICES}")
     if (review_budget is None) != (block_budget is None):
         raise ValueError("review_budget and block_budget must be given together")
     if not 0.0 < validation_frac < 1.0:
@@ -175,20 +206,40 @@ def train(
     y_tr = train_df[LABEL].to_numpy()
     y_te = test_df[LABEL].to_numpy()
 
-    mean, scale = fit_standardiser(train_df[feature_cols])
-    clf = LogisticRegression(C=C, class_weight="balanced", max_iter=2000)
-    clf.fit((X_tr - mean) / scale, y_tr)
-
-    p_te = clf.predict_proba((X_te - mean) / scale)[:, 1]
     version = version or datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    model = LogisticBaseline(
-        feature_names=feature_cols,
-        mean=mean.tolist(),
-        scale=scale.tolist(),
-        coef=clf.coef_[0].tolist(),
-        intercept=float(clf.intercept_[0]),
-        version=version,
-    )
+    model: ScoringModel
+    if model_type == "logreg":
+        mean, scale = fit_standardiser(train_df[feature_cols])
+        clf = LogisticRegression(C=C, class_weight="balanced", max_iter=2000)
+        clf.fit((X_tr - mean) / scale, y_tr)
+        p_te = clf.predict_proba((X_te - mean) / scale)[:, 1]
+        model = LogisticBaseline(
+            feature_names=feature_cols,
+            mean=mean.tolist(),
+            scale=scale.tolist(),
+            coef=clf.coef_[0].tolist(),
+            intercept=float(clf.intercept_[0]),
+            version=version,
+        )
+        hyperparams: dict[str, Any] = {"C": C}
+    else:
+        gbt = GradientBoostingClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            random_state=random_state,
+        )
+        # Trees take raw features (no standardisation); balance classes like the baseline.
+        gbt.fit(X_tr, y_tr, sample_weight=compute_sample_weight("balanced", y_tr))
+        p_te = gbt.predict_proba(X_te)[:, 1]
+        model = GradientBoostedTrees.from_sklearn(gbt, feature_cols, X_tr, version=version)
+        _check_export_parity(model, gbt, X_te if len(X_te) else X_tr)
+        hyperparams = {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "learning_rate": learning_rate,
+            "random_state": random_state,
+        }
 
     metrics = {
         "model": _metrics(y_te, p_te, 0.5),
@@ -198,7 +249,8 @@ def train(
         "data": str(data_path),
         "nrows": nrows,
         "window_steps": window_steps,
-        "C": C,
+        "model_type": model_type,
+        "hyperparams": hyperparams,
     }
     if review_budget is not None and block_budget is not None:
         metrics["alert_budget"] = _alert_budget(
@@ -239,7 +291,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--test-frac", type=float, default=0.2)
     ap.add_argument("--gap-steps", type=int, default=24)
     ap.add_argument("--window-steps", type=int, default=24)
-    ap.add_argument("--C", type=float, default=1.0)
+    ap.add_argument(
+        "--model",
+        choices=MODEL_CHOICES,
+        default="logreg",
+        help="logreg (default): logistic baseline; gbt: gradient-boosted trees + TreeSHAP",
+    )
+    ap.add_argument("--C", type=float, default=1.0, help="logreg: inverse regularisation")
+    ap.add_argument("--n-estimators", type=int, default=100, help="gbt: number of trees")
+    ap.add_argument("--max-depth", type=int, default=3, help="gbt: depth of each tree")
+    ap.add_argument("--learning-rate", type=float, default=0.1, help="gbt: shrinkage")
     ap.add_argument("--version", default=None)
     ap.add_argument(
         "--review-budget",
@@ -281,6 +342,10 @@ def main(argv: list[str] | None = None) -> None:
         block_budget=a.block_budget,
         validation_frac=a.validation_frac,
         model_weight=a.model_weight,
+        model_type=a.model,
+        n_estimators=a.n_estimators,
+        max_depth=a.max_depth,
+        learning_rate=a.learning_rate,
     )
     summary = {"model": m["model"], "rules_only_baseline": m["rules_only_baseline"]}
     if "alert_budget" in m:

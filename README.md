@@ -13,8 +13,9 @@ The scoring has two layers:
 
 1. **Transparent rules** (R001–R008), points-based, readable by an analyst. These work
    from day one with no training data.
-2. **An optional logistic-regression baseline** trained on [PaySim](docs/dataset-paysim.md).
-   Its per-feature contributions are exact, so the explanation *is* the model.
+2. **An optional model** trained on [PaySim](docs/dataset-paysim.md): a logistic-regression
+   baseline (its per-feature contributions are exact, so the explanation *is* the model) or
+   gradient-boosted trees with exact TreeSHAP explanations. Both are served in pure Python.
 
 The offline pipeline is built to be **leakage-safe**: it uses the same feature code as the
 API, point-in-time velocity features, a time-based split with a gap, and checks that stop
@@ -250,7 +251,8 @@ pushed risk up, each with its exact log-odds contribution.
 ```
 features   = compute_features(txn, velocity_snapshot_before_txn)
 rules      = Σ points of fired rules, capped at 100  → rules_score ∈ [0, 1]
-model      = σ(intercept + Σ coef_i · (x_i − μ_i) / σ_i)      (optional)
+model      = σ(intercept + Σ coef_i · (x_i − μ_i) / σ_i)      (optional, logistic)
+           | σ(base + Σ_trees tree(x))                         (optional, --model gbt)
 risk_score = w · model + (1 − w) · rules                      (w = FRE_MODEL_WEIGHT)
 decision   = BLOCK if ≥ block_threshold, REVIEW if ≥ review_threshold, else APPROVE
 ```
@@ -337,6 +339,33 @@ the held-out test window: `alert_budget.test` in the metrics JSON reports the re
 alert rate, precision and recall at each level. Scores are computed with the same
 `blend_risk` the API uses, so set `--model-weight` to your `FRE_MODEL_WEIGHT`.
 
+### Gradient-boosted trees (TreeSHAP)
+
+```bash
+python -m fraud_engine.train --data data/raw/paysim.csv --model gbt \
+    --n-estimators 100 --max-depth 3 --learning-rate 0.1 --out models/gbt.json
+FRE_MODEL_PATH=models/gbt.json make run
+```
+
+`--model gbt` fits scikit-learn's `GradientBoostingClassifier` (class-balanced sample
+weights) on **exactly the same point-in-time features, split and leakage checks** as the
+baseline, then exports every tree to a JSON artifact (`model_type:
+"gradient_boosted_trees"`). Training fails if the pure-Python export disagrees with
+scikit-learn's log-odds on the test window. The API needs no new dependencies:
+
+- `FRE_MODEL_PATH` / `FRE_SHADOW_MODEL_PATH` load either artifact type automatically, so a
+  GBT candidate can be **shadowed** against a live logistic model before promotion.
+- `top_features` are exact path-dependent **TreeSHAP** values in log-odds. They are
+  additive: `Σ contributions = log_odds(x) − expected_log_odds`, where the expectation is
+  the cover-weighted training average.
+- `model_version` reads `rules-v…+gbt-<version>` (logistic: `+lr-<version>`).
+- Cost is O(trees × leaves × depth²) per request: about 4 ms for 100 depth-3 trees on a
+  laptop, so keep ensembles small or raise latency budgets accordingly.
+
+Artifacts are validated on load (finite values, child indices that can only point
+forward, child covers summing to the parent's, depth ≤ 32) — see
+[docs/model-artifact-integrity.md](docs/model-artifact-integrity.md).
+
 To try the pipeline without the real dataset: `make train-synthetic` (the metrics are
 meaningless, it only proves the plumbing works).
 
@@ -384,9 +413,10 @@ make lint typecheck
 | `test_state_redis.py` | Redis backend (fakeredis): same window semantics, parity with in-memory, shared state across replicas, namespacing |
 | `test_rules.py` | Each rule, capping, ordering, configurable thresholds |
 | `test_model.py` | Contributions sum to the logit, persistence, schema guards |
+| `test_trees.py` | Gradient-boosted trees: TreeSHAP equals brute-force Shapley values, additivity, scikit-learn export parity, artifact validation, loader dispatch, serving + shadowing |
 | `test_scoring.py` | Rules-only vs blended, decisions, stateful velocity, settings |
 | `test_preprocessing.py` | **Leakage tests**: label independence, future invariance, online/offline parity, split gap, forbidden columns |
-| `test_train.py` | End-to-end training on synthetic data, CLI |
+| `test_train.py` | End-to-end training (logistic and `--model gbt`) on synthetic data, CLI, export parity gate |
 | `test_api.py` | All endpoints, validation, label rejection, batch limits, metrics |
 | `test_metrics.py` | Rule-hit counters, cumulative score histogram, no identifiers in labels |
 | `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
@@ -430,7 +460,7 @@ are in [docs/cicd.md](docs/cicd.md).
 |---|---|---|
 | `FRE_REVIEW_THRESHOLD` | `0.5` | Score at/above which → `REVIEW` |
 | `FRE_BLOCK_THRESHOLD` | `0.8` | Score at/above which → `BLOCK` |
-| `FRE_MODEL_PATH` | unset | Path to `baseline.json`. Unset means rules-only |
+| `FRE_MODEL_PATH` | unset | Path to a model artifact (logistic or gradient-boosted trees). Unset means rules-only |
 | `FRE_MODEL_WEIGHT` | `0.6` | Blend weight of the model vs rules |
 | `FRE_VELOCITY_WINDOW_STEPS` | `24` | Velocity look-back (PaySim steps = hours) |
 | `FRE_HIGH_AMOUNT_THRESHOLD` | `200000` | R003 threshold |
@@ -460,6 +490,8 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── state_redis.py     Redis-backed VelocityStore (optional extra)
 │   ├── rules.py           Rulebook R001–R008
 │   ├── model.py           Pure-Python logistic baseline + exact explanations
+│   ├── trees.py           Pure-Python gradient-boosted trees + exact TreeSHAP
+│   ├── artifacts.py       Model artifact loader (dispatch on model_type)
 │   ├── preprocessing.py   Leakage-safe PaySim pipeline + checks
 │   ├── train.py           Training CLI
 │   ├── synthetic.py       PaySim-shaped generator for CI
@@ -480,7 +512,8 @@ are in [docs/cicd.md](docs/cicd.md).
 ## Roadmap
 
 - [x] Redis-backed `VelocityStore` for multi-replica deployments (`FRE_VELOCITY_BACKEND=redis`)
-- [ ] Gradient-boosted model with SHAP explanations, keeping the rules as a floor
+- [x] Gradient-boosted model with exact TreeSHAP explanations (`--model gbt`, pure-Python serving)
+- [ ] Rules as a hard score floor for the model blend
 - [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
 - [ ] Kafka consumer mode for streaming ingestion
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
