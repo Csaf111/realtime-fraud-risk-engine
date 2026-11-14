@@ -20,9 +20,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import __version__
+from .artifacts import ScoringModel, load_model
 from .config import Settings
 from .features import compute_features
-from .model import LogisticBaseline
 from .rules import DEFAULT_RULES, Rule, RuleContext, evaluate_rules
 from .schemas import Decision, FeatureContribution, RiskResult, RuleHit, Transaction
 from .state import VelocityBackend, build_velocity_store
@@ -58,10 +58,10 @@ class RiskEngine:
     def __init__(
         self,
         settings: Settings | None = None,
-        model: LogisticBaseline | None = None,
+        model: ScoringModel | None = None,
         store: VelocityBackend | None = None,
         rules: tuple[Rule, ...] = DEFAULT_RULES,
-        shadow_model: LogisticBaseline | None = None,
+        shadow_model: ScoringModel | None = None,
         feature_observer: Callable[[Mapping[str, float]], None] | None = None,
     ) -> None:
         self.feature_observer = feature_observer
@@ -71,13 +71,13 @@ class RiskEngine:
         self.rule_ctx = RuleContext(high_amount_threshold=self.settings.high_amount_threshold)
         self.model = model
         if self.model is None and self.settings.model_path:
-            self.model = LogisticBaseline.load(self.settings.model_path)
+            self.model = load_model(self.settings.model_path)
             log.info("Loaded model %s from %s", self.model.version, self.settings.model_path)
         self.shadow_model = shadow_model
         if self.shadow_model is None and self.settings.shadow_model_path:
             # Fail fast on a bad artifact at startup (caught by readiness during a rollout)
             # rather than silently running without the comparison the operator asked for.
-            self.shadow_model = LogisticBaseline.load(self.settings.shadow_model_path)
+            self.shadow_model = load_model(self.settings.shadow_model_path)
             log.info(
                 "Loaded shadow model %s from %s",
                 self.shadow_model.version,
@@ -91,13 +91,13 @@ class RiskEngine:
     @property
     def model_version(self) -> str:
         base = f"rules-v{__version__}"
-        return f"{base}+lr-{self.model.version}" if self.model else base
+        return f"{base}+{self.model.kind}-{self.model.version}" if self.model else base
 
     @property
     def shadow_model_version(self) -> str | None:
         if self.shadow_model is None:
             return None
-        return f"rules-v{__version__}+lr-{self.shadow_model.version}"
+        return f"rules-v{__version__}+{self.shadow_model.kind}-{self.shadow_model.version}"
 
     def decide(self, score: float) -> Decision:
         if score >= self.settings.block_threshold:
@@ -174,13 +174,13 @@ class RiskEngine:
 
     def _score_shadow(
         self,
-        shadow_model: LogisticBaseline,
+        shadow_model: ScoringModel,
         features: Mapping[str, float],
         rules_score: float,
         primary_decision: Decision,
     ) -> ShadowResult:
         start = time.perf_counter()
-        version = f"rules-v{__version__}+lr-{shadow_model.version}"
+        version = f"rules-v{__version__}+{shadow_model.kind}-{shadow_model.version}"
         try:
             p = shadow_model.predict_proba(features)
             if not math.isfinite(p):
