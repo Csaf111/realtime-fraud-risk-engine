@@ -37,6 +37,8 @@ class LogisticBaseline:
     version: str = "unversioned"
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    kind = "lr"  # short tag used in served model_version strings
+
     def __post_init__(self) -> None:
         n = len(self.feature_names)
         if not (len(self.mean) == len(self.scale) == len(self.coef) == n):

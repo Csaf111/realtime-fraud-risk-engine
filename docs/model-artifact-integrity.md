@@ -6,6 +6,8 @@ The baseline is loaded from a local JSON artifact. It is **not** an authenticate
 
 At model construction, the loader checks the exact ordered feature schema and vector lengths, then rejects NaN and positive/negative infinity in means, scales, coefficients and intercept. This prevents malformed artifacts from silently producing non-finite risk scores or decisions. Existing zero-variance scale handling remains compatible: finite nonpositive scales are normalised to 1.0, as in the original implementation.
 
+Gradient-boosted tree artifacts (`model_type: "gradient_boosted_trees"`, see `fraud_engine/trees.py`) are checked tree by tree: equal-length node arrays, finite thresholds and leaf values, finite positive covers, split features inside the feature schema, child indices that point strictly forward (so no cycles or out-of-range jumps), child covers that sum to the parent's (required for TreeSHAP additivity), at least one tree and a maximum depth of 32 (bounding recursion and per-request latency). Unknown `model_type` values are rejected; artifacts without one are read as logistic baselines for backwards compatibility. Training additionally refuses to write a GBT artifact whose pure-Python predictions disagree with scikit-learn's.
+
 At inference, the model rejects non-finite input feature values before standardisation. The API independently validates incoming monetary values.
 
 ## Remaining risks
