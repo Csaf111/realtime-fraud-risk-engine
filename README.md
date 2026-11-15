@@ -253,7 +253,8 @@ features   = compute_features(txn, velocity_snapshot_before_txn)
 rules      = Σ points of fired rules, capped at 100  → rules_score ∈ [0, 1]
 model      = σ(intercept + Σ coef_i · (x_i − μ_i) / σ_i)      (optional, logistic)
            | σ(base + Σ_trees tree(x))                         (optional, --model gbt)
-risk_score = w · model + (1 − w) · rules                      (w = FRE_MODEL_WEIGHT)
+risk_score = max(w · model + (1 − w) · rules, f · rules)     (w = FRE_MODEL_WEIGHT,
+                                                              f = FRE_RULES_FLOOR, default 0)
 decision   = BLOCK if ≥ block_threshold, REVIEW if ≥ review_threshold, else APPROVE
 ```
 
@@ -337,7 +338,21 @@ Thresholds are picked on the most recent `--validation-frac` (default 20%) of th
 training window using only the served score distribution (no labels), then evaluated on
 the held-out test window: `alert_budget.test` in the metrics JSON reports the realised
 alert rate, precision and recall at each level. Scores are computed with the same
-`blend_risk` the API uses, so set `--model-weight` to your `FRE_MODEL_WEIGHT`.
+`blend_risk` the API uses, so set `--model-weight` to your `FRE_MODEL_WEIGHT` (and
+`--rules-floor` to your `FRE_RULES_FLOOR`).
+
+### Rules as a hard score floor
+
+A blended model can be confidently wrong: with `FRE_MODEL_WEIGHT=0.8`, a model that
+outputs p≈0 pulls a transaction that drains an account through a mule (rules score 0.9)
+down to 0.18 and approves it. `FRE_RULES_FLOOR=f` (0-1) makes the transparent rules a hard
+floor under the blend: `risk_score ≥ f · rules_score`. With `f=1` the model can only ever
+*raise* risk above what the rules alone would score. When the floor sets the score, the
+response carries a `FLOOR:` reason so analysts can see the model was overruled. The floor
+reads nothing but the point-in-time rules score, so it adds no leakage path; training
+(`--rules-floor`) applies the identical `blend_risk` for threshold selection and the drift
+score reference, and the shadow model is floored the same way. Default `0` keeps the plain
+blend.
 
 ### Gradient-boosted trees (TreeSHAP)
 
@@ -415,6 +430,7 @@ make lint typecheck
 | `test_model.py` | Contributions sum to the logit, persistence, schema guards |
 | `test_trees.py` | Gradient-boosted trees: TreeSHAP equals brute-force Shapley values, additivity, scikit-learn export parity, artifact validation, loader dispatch, serving + shadowing |
 | `test_scoring.py` | Rules-only vs blended, decisions, stateful velocity, settings |
+| `test_rules_floor.py` | Rules floor: blend maths, monotonicity, confident-wrong model cannot approve rule-flagged fraud, shadow and training parity |
 | `test_preprocessing.py` | **Leakage tests**: label independence, future invariance, online/offline parity, split gap, forbidden columns |
 | `test_train.py` | End-to-end training (logistic and `--model gbt`) on synthetic data, CLI, export parity gate |
 | `test_api.py` | All endpoints, validation, label rejection, batch limits, metrics |
@@ -462,6 +478,7 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_BLOCK_THRESHOLD` | `0.8` | Score at/above which → `BLOCK` |
 | `FRE_MODEL_PATH` | unset | Path to a model artifact (logistic or gradient-boosted trees). Unset means rules-only |
 | `FRE_MODEL_WEIGHT` | `0.6` | Blend weight of the model vs rules |
+| `FRE_RULES_FLOOR` | `0` | Rules as a hard floor under the blend: `risk ≥ floor × rules_score` (0-1) |
 | `FRE_VELOCITY_WINDOW_STEPS` | `24` | Velocity look-back (PaySim steps = hours) |
 | `FRE_HIGH_AMOUNT_THRESHOLD` | `200000` | R003 threshold |
 | `FRE_MAX_BATCH_SIZE` | `1000` | Batch endpoint limit |
@@ -513,7 +530,7 @@ are in [docs/cicd.md](docs/cicd.md).
 
 - [x] Redis-backed `VelocityStore` for multi-replica deployments (`FRE_VELOCITY_BACKEND=redis`)
 - [x] Gradient-boosted model with exact TreeSHAP explanations (`--model gbt`, pure-Python serving)
-- [ ] Rules as a hard score floor for the model blend
+- [x] Rules as a hard score floor for the model blend (`FRE_RULES_FLOOR`, `--rules-floor`)
 - [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
 - [ ] Kafka consumer mode for streaming ingestion
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`

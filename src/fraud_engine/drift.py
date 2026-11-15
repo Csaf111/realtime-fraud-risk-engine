@@ -85,6 +85,7 @@ class ScoreReference:
     proportions: list[float]
     n: int
     model_weight: float | None = None
+    rules_floor: float | None = None
     steps: list[int] = field(default_factory=list)
     model_version: str | None = None
 
@@ -120,6 +121,7 @@ class ScoreReference:
             proportions=[float(p) for p in data["proportions"]],
             n=int(data["n"]),
             model_weight=data.get("model_weight"),
+            rules_floor=data.get("rules_floor"),
             steps=[int(s) for s in data.get("steps", [])],
             model_version=data.get("model_version"),
         )
