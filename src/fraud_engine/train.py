@@ -67,12 +67,14 @@ def _metrics(y: np.ndarray, p: np.ndarray, threshold: float) -> dict[str, float]
     }
 
 
-def _served_scores(model: ScoringModel, frame: Any, model_weight: float) -> list[float]:
+def _served_scores(
+    model: ScoringModel, frame: Any, model_weight: float, rules_floor: float = 0.0
+) -> list[float]:
     """Blended risk scores for a feature frame, computed exactly as the API serves them."""
     feats = frame[list(FEATURE_NAMES)].to_dict(orient="records")
     rules = frame["rules_score"].tolist()
     return [
-        blend_risk(model.predict_proba(f), float(r), model_weight)
+        blend_risk(model.predict_proba(f), float(r), model_weight, rules_floor)
         for f, r in zip(feats, rules, strict=True)
     ]
 
@@ -101,7 +103,11 @@ def reference_path_for(model_path: str | Path) -> Path:
 
 
 def _score_reference(
-    model: ScoringModel, train_df: Any, validation_frac: float, model_weight: float
+    model: ScoringModel,
+    train_df: Any,
+    validation_frac: float,
+    model_weight: float,
+    rules_floor: float = 0.0,
 ) -> ScoreReference:
     """Served-score distribution on the most recent slice of the training window.
 
@@ -109,8 +115,9 @@ def _score_reference(
     """
     val_df = _validation_slice(train_df, validation_frac)
     return ScoreReference.from_scores(
-        _served_scores(model, val_df, model_weight),
+        _served_scores(model, val_df, model_weight, rules_floor),
         model_weight=model_weight,
+        rules_floor=rules_floor,
         steps=[int(val_df["step"].min()), int(val_df["step"].max())],
         model_version=model.version,
     )
@@ -146,6 +153,7 @@ def _alert_budget(
     block_budget: float,
     validation_frac: float,
     model_weight: float,
+    rules_floor: float = 0.0,
 ) -> dict[str, Any]:
     """Pick thresholds on the most recent slice of the training window, report on test.
 
@@ -153,12 +161,13 @@ def _alert_budget(
     """
     val_df = _validation_slice(train_df, validation_frac)
     selection = select_thresholds(
-        _served_scores(model, val_df, model_weight), review_budget, block_budget
+        _served_scores(model, val_df, model_weight, rules_floor), review_budget, block_budget
     )
-    test_scores = _served_scores(model, test_df, model_weight)
+    test_scores = _served_scores(model, test_df, model_weight, rules_floor)
     return {
         **selection.as_dict(),
         "model_weight": model_weight,
+        "rules_floor": rules_floor,
         "validation_rows": len(val_df),
         "validation_steps": [int(val_df["step"].min()), int(val_df["step"].max())],
         "test": evaluate_thresholds(
@@ -183,6 +192,7 @@ def train(
     block_budget: float | None = None,
     validation_frac: float = 0.2,
     model_weight: float = 0.6,
+    rules_floor: float = 0.0,
     model_type: str = "logreg",
     n_estimators: int = 100,
     max_depth: int = 3,
@@ -195,6 +205,8 @@ def train(
         raise ValueError("review_budget and block_budget must be given together")
     if not 0.0 < validation_frac < 1.0:
         raise ValueError("validation_frac must be between 0 and 1")
+    if not 0.0 <= rules_floor <= 1.0:  # also rejects NaN
+        raise ValueError("rules_floor must be between 0 and 1")
     raw = load_paysim(data_path, nrows=nrows)
     frame = build_feature_frame(raw, window_steps=window_steps)
     train_df, test_df, split = temporal_split(frame, test_frac=test_frac, gap_steps=gap_steps)
@@ -254,15 +266,23 @@ def train(
     }
     if review_budget is not None and block_budget is not None:
         metrics["alert_budget"] = _alert_budget(
-            model, train_df, test_df, review_budget, block_budget, validation_frac, model_weight
+            model,
+            train_df,
+            test_df,
+            review_budget,
+            block_budget,
+            validation_frac,
+            model_weight,
+            rules_floor,
         )
-    reference = _score_reference(model, train_df, validation_frac, model_weight)
+    reference = _score_reference(model, train_df, validation_frac, model_weight, rules_floor)
     ref_path = reference_path_for(out_path)
     metrics["score_reference"] = {
         "path": str(ref_path),
         "rows": reference.n,
         "steps": reference.steps,
         "model_weight": model_weight,
+        "rules_floor": rules_floor,
     }
     feature_reference = _feature_reference(model, train_df, validation_frac)
     feat_ref_path = feature_reference_path_for(out_path)
@@ -319,6 +339,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--model-weight", type=float, default=0.6, help="Blend weight, as FRE_MODEL_WEIGHT"
     )
+    ap.add_argument(
+        "--rules-floor",
+        type=float,
+        default=0.0,
+        help="Rules as a hard score floor (0-1), as FRE_RULES_FLOOR",
+    )
     a = ap.parse_args(argv)
     if (a.review_budget is None) != (a.block_budget is None):
         ap.error("--review-budget and --block-budget must be given together")
@@ -342,6 +368,7 @@ def main(argv: list[str] | None = None) -> None:
         block_budget=a.block_budget,
         validation_frac=a.validation_frac,
         model_weight=a.model_weight,
+        rules_floor=a.rules_floor,
         model_type=a.model,
         n_estimators=a.n_estimators,
         max_depth=a.max_depth,
@@ -357,7 +384,8 @@ def main(argv: list[str] | None = None) -> None:
             print("WARNING: alert budget not attainable on the validation window (score ties)")
         print(
             f"Recommended: FRE_REVIEW_THRESHOLD={ab['review_threshold']} "
-            f"FRE_BLOCK_THRESHOLD={ab['block_threshold']} FRE_MODEL_WEIGHT={a.model_weight}"
+            f"FRE_BLOCK_THRESHOLD={ab['block_threshold']} FRE_MODEL_WEIGHT={a.model_weight} "
+            f"FRE_RULES_FLOOR={a.rules_floor}"
         )
     print(f"Saved model to {a.out}")
     print(f"Saved drift score reference to {m['score_reference']['path']}")

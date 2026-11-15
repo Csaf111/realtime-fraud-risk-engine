@@ -77,7 +77,7 @@ flowchart LR
     txn --> RB["Rules<br/>points → rules_score ∈ [0,1]"]
     F --> LR["Logistic regression<br/>contribution_i = coef_i · z_i<br/>or GBT + TreeSHAP"]
     LR --> P["p(fraud)"]
-    RB --> B(("Blend<br/>w = FRE_MODEL_WEIGHT"))
+    RB --> B(("Blend<br/>w = FRE_MODEL_WEIGHT<br/>floor = FRE_RULES_FLOOR · rules"))
     P --> B
     B --> D{"Thresholds"}
     D -- "< review" --> AP["APPROVE"]
@@ -129,7 +129,7 @@ flowchart LR
 | Concern | Today (starter) | Next step |
 |---|---|---|
 | Velocity state | In-process deques by default; `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
-| Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + SHAP. Keep the rules as a floor |
+| Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |

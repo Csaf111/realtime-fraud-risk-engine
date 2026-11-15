@@ -29,6 +29,9 @@ class Settings:
         model_path: optional path to a trained baseline model artifact (JSON).
             When unset, the engine runs in rules-only mode.
         model_weight: blend weight of the model probability vs. the rules score (0-1).
+        rules_floor: makes the rules a hard floor under the blend (0-1): the final score
+            is never below ``rules_floor * rules_score``. ``0`` (default) disables it;
+            ``1`` means the model can never pull a score below the rules-only score.
         velocity_window_steps: look-back window for velocity features, in PaySim
             steps (1 step = 1 simulated hour).
         high_amount_threshold: amount above which rule R003 fires.
@@ -58,6 +61,7 @@ class Settings:
     block_threshold: float = 0.8
     model_path: str | None = None
     model_weight: float = 0.6
+    rules_floor: float = 0.0
     velocity_window_steps: int = 24
     high_amount_threshold: float = 200_000.0
     max_batch_size: int = 1000
@@ -78,6 +82,8 @@ class Settings:
             raise ValueError("Require 0 <= review_threshold <= block_threshold <= 1")
         if not 0.0 <= self.model_weight <= 1.0:
             raise ValueError("model_weight must be between 0 and 1")
+        if not 0.0 <= self.rules_floor <= 1.0:  # also rejects NaN
+            raise ValueError("rules_floor must be between 0 and 1")
         if self.velocity_window_steps < 1:
             raise ValueError("velocity_window_steps must be >= 1")
         if self.velocity_backend not in VELOCITY_BACKENDS:
@@ -100,6 +106,7 @@ class Settings:
             block_threshold=_float("FRE_BLOCK_THRESHOLD", 0.8),
             model_path=os.getenv("FRE_MODEL_PATH") or None,
             model_weight=_float("FRE_MODEL_WEIGHT", 0.6),
+            rules_floor=_float("FRE_RULES_FLOOR", 0.0),
             velocity_window_steps=_int("FRE_VELOCITY_WINDOW_STEPS", 24),
             high_amount_threshold=_float("FRE_HIGH_AMOUNT_THRESHOLD", 200_000.0),
             max_batch_size=_int("FRE_MAX_BATCH_SIZE", 1000),

@@ -26,7 +26,7 @@ from .features import compute_features
 from .rules import DEFAULT_RULES, Rule, RuleContext, evaluate_rules
 from .schemas import Decision, FeatureContribution, RiskResult, RuleHit, Transaction
 from .state import VelocityBackend, build_velocity_store
-from .thresholds import blend_risk
+from .thresholds import blend_risk, rules_floor_binds
 
 log = logging.getLogger(__name__)
 
@@ -131,14 +131,21 @@ class RiskEngine:
         if self.model is not None:
             model_score, contribs = self.model.explain(features)
             top = [FeatureContribution(feature=f, value=v, contribution=c) for f, v, c in contribs]
-            risk = blend_risk(model_score, rules_score, self.settings.model_weight)
+            weight, floor = self.settings.model_weight, self.settings.rules_floor
+            risk = blend_risk(model_score, rules_score, weight, floor)
+            floored = rules_floor_binds(model_score, rules_score, weight, floor)
         else:
             risk = round(min(max(rules_score, 0.0), 1.0), 6)
+            floored = False
 
         reasons = [f"{r.code}: {r.description}" for r in hits]
         reasons += [
             f"MODEL: {c.feature} raised risk (+{c.contribution:.2f} log-odds)" for c in top[:3]
         ]
+        if floored:
+            reasons.append(
+                f"FLOOR: rules score held risk at >= {self.settings.rules_floor:g} x rules score"
+            )
 
         # 4. Record AFTER scoring so future events see this one.
         if update_state:
@@ -185,7 +192,9 @@ class RiskEngine:
             p = shadow_model.predict_proba(features)
             if not math.isfinite(p):
                 raise ValueError(f"shadow model returned non-finite probability {p!r}")
-            risk: float | None = blend_risk(p, rules_score, self.settings.model_weight)
+            risk: float | None = blend_risk(
+                p, rules_score, self.settings.model_weight, self.settings.rules_floor
+            )
         except Exception:  # a shadow candidate must never fail a live request
             log.exception("Shadow model %s failed; primary result unaffected", version)
             risk = None
