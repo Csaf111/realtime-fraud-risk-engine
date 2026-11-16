@@ -23,7 +23,8 @@ def test_temporal_partitions_exclude_embargo(tmp_path):
     report = evaluate_csv(path, budgets=(0.1,))
     assert report["source_rows"] == 40
     assert report["embargoed_records"] > 0
-    assert sum(report[key]["records"] for key in ("train", "validation", "test")) + report["embargoed_records"] == 40
+    included = sum(report[key]["records"] for key in ("train", "validation", "test"))
+    assert included + report["embargoed_records"] == 40
     assert report["test"]["alert_budgets"]["0.1"]["alerts"] >= 1
 
 
