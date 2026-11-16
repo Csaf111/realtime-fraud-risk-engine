@@ -20,10 +20,32 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-def blend_risk(model_score: float, rules_score: float, model_weight: float) -> float:
-    """Final risk score exactly as served: blend, clip to [0, 1], round to 6 dp."""
+def blend_risk(
+    model_score: float, rules_score: float, model_weight: float, rules_floor: float = 0.0
+) -> float:
+    """Final risk score exactly as served: blend, apply the rules floor, clip, round to 6 dp.
+
+    ``rules_floor`` (0-1) makes the rules a *hard floor* under the blend: the final score is
+    never below ``rules_floor * rules_score``. With ``rules_floor=1`` a confident-but-wrong
+    model can never pull a transaction below what the transparent rules alone would score;
+    with the default ``0`` the score is the plain weighted blend (backwards compatible).
+    The floor only depends on the rules score, which is itself point-in-time and
+    label-free, so it adds no leakage path and keeps online/offline parity.
+    """
     risk = model_weight * model_score + (1 - model_weight) * rules_score
+    risk = max(risk, rules_floor * rules_score)
     return round(min(max(risk, 0.0), 1.0), 6)
+
+
+def rules_floor_binds(
+    model_score: float, rules_score: float, model_weight: float, rules_floor: float
+) -> bool:
+    """True when the rules floor (not the blend) set the served score."""
+    if rules_floor <= 0.0:
+        return False
+    return blend_risk(model_score, rules_score, model_weight, rules_floor) > blend_risk(
+        model_score, rules_score, model_weight
+    )
 
 
 def _check_rate(name: str, rate: float) -> None:

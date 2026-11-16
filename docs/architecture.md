@@ -61,6 +61,9 @@ flowchart TD
     checks -- violation --> fail["LeakageError ✗"]
     checks -- ok --> scale["fit_standardiser(train only)"]
     scale --> fit["LogisticRegression<br/>class_weight=balanced"]
+    checks -- "ok, --model gbt" --> gbt["GradientBoostingClassifier<br/>balanced sample weights"]
+    gbt --> parity{"export parity<br/>vs sklearn log-odds"}
+    parity -- ok --> eval
     fit --> eval["Evaluate on test<br/>model vs rules-only"]
     eval --> art[("models/baseline.json<br/>+ metrics.json<br/>+ score_reference.json")]
     art -. "FRE_MODEL_PATH" .-> serve["API / container"]
@@ -72,9 +75,9 @@ flowchart TD
 flowchart LR
     txn["Transaction"] --> F["17 features"]
     txn --> RB["Rules<br/>points → rules_score ∈ [0,1]"]
-    F --> LR["Logistic regression<br/>contribution_i = coef_i · z_i"]
+    F --> LR["Logistic regression<br/>contribution_i = coef_i · z_i<br/>or GBT + TreeSHAP"]
     LR --> P["p(fraud)"]
-    RB --> B(("Blend<br/>w = FRE_MODEL_WEIGHT"))
+    RB --> B(("Blend<br/>w = FRE_MODEL_WEIGHT<br/>floor = FRE_RULES_FLOOR · rules"))
     P --> B
     B --> D{"Thresholds"}
     D -- "< review" --> AP["APPROVE"]
@@ -84,8 +87,12 @@ flowchart LR
     LR --> X
 ```
 
-The model is linear in standardised features. Each feature's log-odds contribution is exact,
-not a SHAP-style approximation. Rule hits carry stable codes that analysts can look up via
+The logistic model is linear in standardised features, so each feature's log-odds
+contribution is exact, not a SHAP-style approximation. The optional gradient-boosted tree
+model (`fraud_engine/trees.py`) explains with exact path-dependent TreeSHAP, computed in pure
+Python: contributions still sum to the log-odds, minus the training-window expectation.
+Both models consume the same `compute_features` output, so the leakage guarantees and
+online/offline parity are identical. Rule hits carry stable codes that analysts can look up via
 `GET /v1/rules`.
 
 ### Shadow models
@@ -122,8 +129,8 @@ flowchart LR
 | Concern | Today (starter) | Next step |
 |---|---|---|
 | Velocity state | In-process deques by default; `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
-| Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + SHAP. Keep the rules as a floor |
+| Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
-| Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
+| Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once) | Consumer-group rebalance hooks and stream metrics export |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
 | Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |
