@@ -131,6 +131,6 @@ flowchart LR
 | Velocity state | In-process deques by default; `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
-| Ingestion | Synchronous HTTP | Kafka consumer that scores events and emits decisions |
+| Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once) | Consumer-group rebalance hooks and stream metrics export |
 | Feedback | None | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
 | Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |

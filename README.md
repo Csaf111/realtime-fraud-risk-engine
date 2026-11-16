@@ -395,7 +395,9 @@ python -m fraud_engine.stream --input txns.jsonl --output results.jsonl --dead-l
 Bad messages (invalid JSON, label columns, oversized) go to a dead-letter sink instead of
 stopping the consumer, late events can be rejected with `--allowed-lateness`, and a Kafka
 loop (`--kafka-topic`, optional `confluent-kafka` client) commits offsets only after each
-result is written. Details and ordering caveats: [docs/streaming.md](docs/streaming.md).
+result is written. Results and dead letters can go back to Kafka with `--output-topic` /
+`--dead-letter-topic` (keyed by `transaction_id`, idempotent producer, delivery confirmed
+before the input offset is committed). Details and ordering caveats: [docs/streaming.md](docs/streaming.md).
 
 ## Architecture
 
@@ -532,7 +534,7 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Gradient-boosted model with exact TreeSHAP explanations (`--model gbt`, pure-Python serving)
 - [x] Rules as a hard score floor for the model blend (`FRE_RULES_FLOOR`, `--rules-floor`)
 - [x] Threshold selection from an alert budget on a validation window (`--review-budget` / `--block-budget`)
-- [ ] Kafka consumer mode for streaming ingestion
+- [ ] Kafka consumer mode for streaming ingestion (consume + produce-back done: `--output-topic`; rebalance hooks and stream metrics pending)
 - [x] Monitoring metrics: per-rule hit counts and risk-score histogram on `/metrics`
 - [x] Drift detection: PSI of live score distribution vs the training window (`fre_score_psi`, example alert rule)
 - [x] Feature-level drift: PSI per input feature (`FRE_FEATURE_REFERENCE_PATH`, `fre_feature_psi{feature}`)

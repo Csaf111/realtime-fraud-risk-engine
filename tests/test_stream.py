@@ -10,6 +10,8 @@ from fraud_engine.schemas import Decision, RiskResult
 from fraud_engine.scoring import RiskEngine
 from fraud_engine.stream import (
     DeadLetter,
+    KafkaDeliveryError,
+    KafkaTopicSink,
     StreamProcessor,
     main,
     run_kafka,
@@ -221,6 +223,103 @@ def test_sink_failure_prevents_commit():
     assert consumer.committed == []  # message will be redelivered
 
 
+# --- Kafka producer sink --------------------------------------------------------------
+
+
+class FakeProducer:
+    """confluent-kafka style producer: delivery callbacks fire inside flush()."""
+
+    def __init__(self, fail: str | None = None, drop: bool = False, raise_on_produce=None):
+        self.fail, self.drop, self.raise_on_produce = fail, drop, raise_on_produce
+        self.pending: list[Any] = []
+        self.records: list[tuple[str, bytes | None, bytes | None]] = []
+        self.log: list[str] = []
+
+    def produce(self, topic, value=None, key=None, on_delivery=None):
+        if self.raise_on_produce is not None:
+            raise self.raise_on_produce
+        self.log.append(f"produce:{topic}")
+        self.pending.append((topic, value, key, on_delivery))
+
+    def flush(self, timeout: float = -1) -> int:
+        self.log.append("flush")
+        if self.drop:
+            return len(self.pending)
+        for topic, value, key, cb in self.pending:
+            if self.fail is None:
+                self.records.append((topic, key, value))
+            if cb is not None:
+                cb(self.fail, None)
+        self.pending = []
+        return 0
+
+
+class LoggingConsumer(FakeConsumer):
+    def __init__(self, items, log: list[str]) -> None:
+        super().__init__(items)
+        self.log = log
+
+    def commit(self, message: FakeMsg, asynchronous: bool = True) -> None:
+        super().commit(message, asynchronous)
+        self.log.append(f"commit:{message.offset()}")
+
+
+def test_kafka_sink_keys_results_and_confirms_before_commit():
+    producer = FakeProducer()
+    out = KafkaTopicSink(producer, "risk-results")
+    dlq = KafkaTopicSink(producer, "risk-dlq")
+    proc = StreamProcessor(RiskEngine(), out, dlq)
+    consumer = LoggingConsumer(
+        [
+            FakeMsg(_msg(transaction_id="t1"), 5),
+            FakeMsg(b"{bad", 6),
+            FakeMsg(json.dumps(fraud_txn()).encode(), 7),
+        ],
+        producer.log,
+    )
+    run_kafka(proc, consumer, max_idle_polls=1)
+
+    topics = [t for t, _, _ in producer.records]
+    assert topics == ["risk-results", "risk-dlq", "risk-results"]
+    first = json.loads(producer.records[0][2] or b"")
+    assert producer.records[0][1] == b"t1" and first["transaction_id"] == "t1"
+    assert producer.records[1][1] is None
+    assert json.loads(producer.records[1][2] or b"")["reason"] == "json"
+    assert producer.records[2][1] is None  # no transaction_id -> unkeyed
+    assert json.loads(producer.records[2][2] or b"")["decision"] == "BLOCK"
+    # Each input offset is committed only after its output was flushed and acknowledged.
+    assert producer.log == [
+        "produce:risk-results", "flush", "commit:5",
+        "produce:risk-dlq", "flush", "commit:6",
+        "produce:risk-results", "flush", "commit:7",
+    ]  # fmt: skip
+    assert out.delivered == 2 and dlq.delivered == 1
+
+
+@pytest.mark.parametrize(
+    ("producer", "match"),
+    [
+        (FakeProducer(fail="broker down"), "delivery to 'out' failed: broker down"),
+        (FakeProducer(drop=True), "no delivery report"),
+        (FakeProducer(raise_on_produce=BufferError("queue full")), "produce to 'out' failed"),
+    ],
+)
+def test_kafka_sink_failures_block_commit(producer: FakeProducer, match: str):
+    sink = KafkaTopicSink(producer, "out", delivery_timeout=0.01)
+    consumer = FakeConsumer([FakeMsg(_msg(transaction_id="x"), 9)])
+    proc = StreamProcessor(RiskEngine(), sink)
+    with pytest.raises(KafkaDeliveryError, match=match):
+        run_kafka(proc, consumer, max_idle_polls=1)
+    assert consumer.committed == []  # redelivered on restart
+    assert sink.delivered == 0
+
+
+@pytest.mark.parametrize("kwargs", [{"topic": ""}, {"topic": "t", "delivery_timeout": 0}])
+def test_kafka_sink_invalid_config(kwargs: dict[str, Any]):
+    with pytest.raises(ValueError):
+        KafkaTopicSink(FakeProducer(), **kwargs)
+
+
 # --- CLI -----------------------------------------------------------------------------
 
 
@@ -244,3 +343,35 @@ def test_cli_stdin_to_stdout(monkeypatch, capsys):
     assert main(["--input", "-", "--no-update-state", "--allowed-lateness", "0"]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["decision"] == "APPROVE"
+
+
+def test_cli_writes_results_and_dead_letters_to_kafka_topics(tmp_path, monkeypatch, capsys):
+    producer = FakeProducer()
+    seen: list[str] = []
+
+    def fake_make(bootstrap: str) -> FakeProducer:
+        seen.append(bootstrap)
+        return producer
+
+    monkeypatch.setattr("fraud_engine.stream.make_kafka_producer", fake_make)
+    src = tmp_path / "in.jsonl"
+    src.write_text(json.dumps(make_txn(transaction_id="z")) + "\n{bad\n")
+    args = ["--input", str(src), "--kafka-bootstrap", "b:9092"]
+    assert main([*args, "--output-topic", "res", "--dead-letter-topic", "dlq"]) == 0
+    assert seen == ["b:9092"]
+    assert [(t, k) for t, k, _ in producer.records] == [("res", b"z"), ("dlq", None)]
+    assert capsys.readouterr().out == ""  # nothing went to stdout
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--output-topic", "res", "--output", "x.jsonl"],
+        ["--dead-letter-topic", "dlq", "--dead-letter", "x.jsonl"],
+    ],
+)
+def test_cli_rejects_file_and_topic_for_same_output(tmp_path, extra: list[str]):
+    src = tmp_path / "in.jsonl"
+    src.write_text("")
+    with pytest.raises(SystemExit):
+        main(["--input", str(src), *extra])
