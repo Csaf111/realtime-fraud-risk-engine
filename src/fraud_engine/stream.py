@@ -12,6 +12,9 @@ topic. This module is the transport-agnostic core of that mode:
 * ``run_kafka`` is a thin at-least-once loop over a confluent-kafka style consumer
   (``poll()`` / ``commit()``). The client library is an optional dependency and is only
   imported when Kafka mode is actually used, so the serving image stays slim.
+* ``KafkaTopicSink`` writes results (keyed by ``transaction_id``) and dead letters back
+  to Kafka topics, confirming delivery before returning so the consumer only commits
+  input offsets whose output is durably on the broker.
 * ``python -m fraud_engine.stream --input file.jsonl`` replays JSON lines through the
   processor and writes one result per line, handy for backfills and demos.
 
@@ -236,6 +239,88 @@ def run_kafka(
     return processor.stats
 
 
+class KafkaDeliveryError(RuntimeError):
+    """A record could not be confirmed as delivered to its output topic."""
+
+
+class KafkaProducerLike(Protocol):
+    def produce(
+        self,
+        topic: str,
+        value: bytes | None = ...,
+        key: bytes | None = ...,
+        on_delivery: Callable[[Any, Any], None] | None = ...,
+    ) -> Any: ...
+    def flush(self, timeout: float = ...) -> int: ...
+
+
+class KafkaTopicSink:
+    """Synchronous sink that writes results or dead letters to a Kafka topic.
+
+    Each call produces one record and blocks until the broker acknowledges it (or
+    ``delivery_timeout`` seconds pass). Any delivery error or timeout raises
+    ``KafkaDeliveryError``; under ``run_kafka`` that means the input offset is *not*
+    committed and the message is redelivered, which keeps the pipeline at-least-once
+    end to end. Results are keyed by ``transaction_id`` so downstream consumers (or a
+    compacted topic) can de-duplicate redeliveries; dead letters are unkeyed.
+
+    Flushing per record trades throughput for a simple, provably safe commit order. It is
+    the right default for a skeleton; batching would need commit-after-batch-flush.
+    """
+
+    def __init__(
+        self, producer: KafkaProducerLike, topic: str, *, delivery_timeout: float = 10.0
+    ) -> None:
+        if not topic:
+            raise ValueError("topic must be non-empty")
+        if delivery_timeout <= 0:
+            raise ValueError("delivery_timeout must be > 0")
+        self.producer = producer
+        self.topic = topic
+        self.delivery_timeout = delivery_timeout
+        self.delivered = 0
+
+    def __call__(self, record: RiskResult | DeadLetter) -> None:
+        if isinstance(record, RiskResult):
+            key = record.transaction_id.encode("utf-8") if record.transaction_id else None
+            value = record.model_dump_json().encode("utf-8")
+        else:
+            key, value = None, record.to_json().encode("utf-8")
+
+        outcome: list[Any] = []
+
+        def on_delivery(err: Any, _msg: Any) -> None:
+            outcome.append(err)
+
+        try:
+            self.producer.produce(self.topic, value=value, key=key, on_delivery=on_delivery)
+        except Exception as exc:  # BufferError, KafkaException, ...
+            raise KafkaDeliveryError(f"produce to {self.topic!r} failed: {exc}") from exc
+        remaining = self.producer.flush(self.delivery_timeout)
+        if not outcome:
+            raise KafkaDeliveryError(
+                f"no delivery report from {self.topic!r} within {self.delivery_timeout}s "
+                f"({remaining} still queued)"
+            )
+        if outcome[0] is not None:
+            raise KafkaDeliveryError(f"delivery to {self.topic!r} failed: {outcome[0]}")
+        self.delivered += 1
+
+
+def make_kafka_producer(bootstrap: str) -> KafkaProducerLike:  # pragma: no cover - needs a broker
+    """Build an idempotent confluent-kafka producer (``acks=all``)."""
+    try:
+        from confluent_kafka import Producer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Kafka mode needs the optional client: pip install confluent-kafka"
+        ) from exc
+    producer: KafkaProducerLike = Producer(
+        {"bootstrap.servers": bootstrap, "enable.idempotence": True, "acks": "all"}
+    )
+    return producer
+
+
 def make_kafka_consumer(  # pragma: no cover - needs the optional client and a broker
     bootstrap: str, topic: str, group_id: str
 ) -> KafkaConsumerLike:
@@ -280,20 +365,50 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--kafka-topic", help="Kafka topic to consume (needs confluent-kafka)")
     p.add_argument("--kafka-bootstrap", default="localhost:9092")
     p.add_argument("--kafka-group", default="fraud-engine")
-    p.add_argument("--output", default="-", help="Where to write result JSON lines")
+    p.add_argument("--output", help="Where to write result JSON lines (default: stdout)")
     p.add_argument("--dead-letter", help="Where to write dead-letter JSON lines")
+    p.add_argument(
+        "--output-topic", help="Kafka topic for results (keyed by transaction_id) instead of a file"
+    )
+    p.add_argument("--dead-letter-topic", help="Kafka topic for dead letters instead of a file")
+    p.add_argument("--delivery-timeout", type=float, default=10.0, metavar="SECONDS")
     p.add_argument("--allowed-lateness", type=int, default=None, metavar="STEPS")
     p.add_argument("--no-update-state", action="store_true", help="Score without recording")
     args = p.parse_args(argv)
+    if args.output_topic and args.output:
+        p.error("--output and --output-topic are mutually exclusive")
+    if args.dead_letter_topic and args.dead_letter:
+        p.error("--dead-letter and --dead-letter-topic are mutually exclusive")
 
     engine = RiskEngine(Settings.from_env())
-    out: IO[str] = sys.stdout if args.output == "-" else open(args.output, "w")  # noqa: SIM115
+    producer = (
+        make_kafka_producer(args.kafka_bootstrap)
+        if args.output_topic or args.dead_letter_topic
+        else None
+    )
+    out: IO[str] = (
+        sys.stdout if args.output in (None, "-") else open(args.output, "w")  # noqa: SIM115
+    )
     dl_fh: IO[str] | None = open(args.dead_letter, "w") if args.dead_letter else None  # noqa: SIM115
+    sink: ResultSink
+    dead_letter: DeadLetterSink | None
+    if producer is not None and args.output_topic:
+        sink = KafkaTopicSink(producer, args.output_topic, delivery_timeout=args.delivery_timeout)
+    else:
+        sink = lambda r: print(r.model_dump_json(), file=out)  # noqa: E731
+    if producer is not None and args.dead_letter_topic:
+        dead_letter = KafkaTopicSink(
+            producer, args.dead_letter_topic, delivery_timeout=args.delivery_timeout
+        )
+    elif dl_fh is not None:
+        dead_letter = lambda d: print(d.to_json(), file=dl_fh)  # noqa: E731
+    else:
+        dead_letter = None
     try:
         processor = StreamProcessor(
             engine,
-            sink=lambda r: print(r.model_dump_json(), file=out),
-            dead_letter=(lambda d: print(d.to_json(), file=dl_fh)) if dl_fh else None,
+            sink=sink,
+            dead_letter=dead_letter,
             update_state=not args.no_update_state,
             allowed_lateness_steps=args.allowed_lateness,
         )
