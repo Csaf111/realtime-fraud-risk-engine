@@ -3,8 +3,8 @@
 `fraud_engine.stream` scores transactions from a log (Kafka today, any ordered source in
 principle) instead of HTTP requests. It is a **skeleton**: the processing core,
 dead-lettering, ordering policy, an at-least-once Kafka loop and Kafka output/dead-letter
-topics are implemented and tested; rebalance hooks and metrics export are not yet (see
-"Not done yet").
+topics and Prometheus metrics export are implemented and tested; rebalance hooks are not
+yet (see "Not done yet").
 
 ```mermaid
 flowchart LR
@@ -47,6 +47,41 @@ to stderr at the end.
 | `--output-topic TOPIC` | Produce results to a Kafka topic instead of `--output` (works with any input) |
 | `--dead-letter-topic TOPIC` | Produce dead letters to a Kafka topic instead of `--dead-letter` |
 | `--delivery-timeout SECONDS` | How long to wait for the broker to acknowledge each record (default 10) |
+| `--metrics-file PATH` | Write `fre_stream_*` Prometheus metrics to `PATH` (textfile-collector format) |
+| `--metrics-every N` | Rewrite `--metrics-file` every `N` messages (default 1000); always written at exit, even on failure |
+
+## Metrics
+
+The consumer has no HTTP port, so its counters are exported as a Prometheus **textfile**:
+point `--metrics-file` at the node-exporter textfile-collector directory (e.g.
+`/var/lib/node_exporter/textfile/fre_stream.prom`), or read it from a sidecar. The file is
+written to a temp file and renamed, so a scrape never sees a partial write.
+
+```bash
+python -m fraud_engine.stream --kafka-topic transactions --output-topic risk-results \
+    --metrics-file /var/lib/node_exporter/textfile/fre_stream.prom --metrics-every 500
+```
+
+| Series | Type | Meaning |
+|---|---|---|
+| `fre_stream_received_total` | counter | Messages received |
+| `fre_stream_scored_total` | counter | Messages validated and scored |
+| `fre_stream_dead_lettered_total` | counter | Messages sent to the dead-letter sink |
+| `fre_stream_dead_letters_total{reason}` | counter | Dead letters by reason (`too_large`, `decode`, `json`, `schema`, `late`) |
+| `fre_stream_late_total` | counter | Events behind the step watermark (scored or rejected) |
+| `fre_stream_committed_total` | counter | Kafka offsets committed after handling |
+| `fre_stream_broker_errors_total` | counter | Broker errors skipped without commit |
+| `fre_stream_decisions_total{decision}` | counter | `APPROVE` / `REVIEW` / `BLOCK` |
+| `fre_stream_rule_hits_total{rule}` | counter | Times each rule fired (once per event) |
+| `fre_stream_watermark_step` | gauge | Highest PaySim step scored so far (absent before the first) |
+
+Labels are only decisions, reason codes and rule codes, so cardinality is fixed and no
+account, amount or transaction ID ever reaches the monitoring stack. Useful alerts:
+`rate(fre_stream_dead_lettered_total[5m]) / rate(fre_stream_received_total[5m])` above a few
+percent (an upstream schema change), a rising `fre_stream_late_total` share (partitioning or
+producer ordering broke), and `fre_stream_watermark_step` not advancing (a stalled consumer).
+The same summary, plus `committed`, `broker_errors`, `watermark` and `rule_hits`, is printed
+to stderr as JSON at exit.
 
 ## Guarantees
 
@@ -91,4 +126,4 @@ The `late` counter makes that skew visible.
 ## Not done yet
 
 - Consumer-group rebalancing hooks and shared velocity state across partitions.
-- Exporting stream stats as Prometheus metrics.
+- Consumer lag (needs broker high-watermarks from the client) in the metrics file.
