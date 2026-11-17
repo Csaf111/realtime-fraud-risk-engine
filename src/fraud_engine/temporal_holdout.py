@@ -70,7 +70,10 @@ def chronological_holdout(
     # Exclude each boundary's adjacent time interval from BOTH partitions.
     boundaries = (distinct[train_end], distinct[validation_end])
     def embargoed(step: int) -> bool:
-        return any(abs(step - boundary) <= embargo_steps for boundary in boundaries)
+        # Zero disables the gap entirely; it must not silently drop boundary rows.
+        return embargo_steps > 0 and any(
+            abs(step - boundary) <= embargo_steps for boundary in boundaries
+        )
 
     train: list[int] = []
     validation: list[int] = []
