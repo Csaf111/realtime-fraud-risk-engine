@@ -61,3 +61,22 @@ def test_does_not_depend_on_labels_or_transaction_fields():
     steps = list(range(30))
     original = chronological_holdout(steps)
     assert original == chronological_holdout(list(steps))
+
+
+def test_zero_embargo_keeps_every_boundary_record():
+    steps = [step for step in range(30) for _ in range(2)]
+    split = chronological_holdout(steps, embargo_steps=0)
+    assert split.embargoed == ()
+    assert len(split.train) == 36
+    assert len(split.validation) == 12
+    assert len(split.test) == 12
+    assert min(steps[i] for i in split.validation) == 18
+    assert min(steps[i] for i in split.test) == 24
+
+
+def test_positive_embargo_excludes_boundary_steps():
+    steps = list(range(30))
+    split = chronological_holdout(steps, embargo_steps=1)
+    assert 18 in split.embargoed
+    assert 24 in split.embargoed
+    assert len(split.embargoed) > 0
