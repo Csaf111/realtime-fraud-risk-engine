@@ -12,9 +12,12 @@ from fraud_engine.stream import (
     DeadLetter,
     KafkaDeliveryError,
     KafkaTopicSink,
+    MetricsTextfileWriter,
     StreamProcessor,
+    StreamStats,
     main,
     run_kafka,
+    write_metrics_textfile,
 )
 
 from .conftest import fraud_txn, make_txn
@@ -201,6 +204,7 @@ def test_run_kafka_commits_after_processing_and_skips_broker_errors():
     # Broker errors are not committed; poison messages are (they went to dead letter).
     assert consumer.committed == [100, 102, 103]
     assert stats.received == 3
+    assert stats.committed == 3 and stats.broker_errors == 1
 
 
 def test_run_kafka_stops_on_max_messages_and_should_stop():
@@ -375,3 +379,131 @@ def test_cli_rejects_file_and_topic_for_same_output(tmp_path, extra: list[str]):
     src.write_text("")
     with pytest.raises(SystemExit):
         main(["--input", str(src), *extra])
+
+
+# --- Prometheus metrics export ---------------------------------------------------------
+
+
+def _parse_prom(text: str) -> dict[str, float]:
+    samples: dict[str, float] = {}
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            name, value = line.rsplit(" ", 1)
+            samples[name] = float(value)
+    return samples
+
+
+def test_render_prometheus_reports_stream_counters():
+    proc, _, _ = _collect(allowed_lateness_steps=0)
+    proc.run(
+        [
+            _msg(step=5, transaction_id="secret-id", nameOrig="C999"),
+            json.dumps(fraud_txn(step=6)),
+            b"{bad",
+            _msg(step=1),  # late, beyond tolerance
+        ]
+    )
+    text = proc.stats.render_prometheus()
+    samples = _parse_prom(text)
+    assert samples["fre_stream_received_total"] == 4
+    assert samples["fre_stream_scored_total"] == 2
+    assert samples["fre_stream_dead_lettered_total"] == 2
+    assert samples['fre_stream_dead_letters_total{reason="json"}'] == 1
+    assert samples['fre_stream_dead_letters_total{reason="late"}'] == 1
+    assert samples["fre_stream_late_total"] == 1
+    assert samples['fre_stream_decisions_total{decision="APPROVE"}'] == 1
+    assert samples['fre_stream_decisions_total{decision="BLOCK"}'] == 1
+    assert samples["fre_stream_watermark_step"] == 6
+    assert any(k.startswith('fre_stream_rule_hits_total{rule="R') for k in samples)
+    assert sum(v for k, v in samples.items() if k.startswith("fre_stream_rule_hits_total")) == sum(
+        proc.stats.rule_hits.values()
+    )
+    # Every exported series has HELP/TYPE metadata, and no message content leaks into labels.
+    for name in {k.split("{")[0] for k in samples}:
+        assert f"# TYPE {name} " in text and f"# HELP {name} " in text
+    assert "secret-id" not in text and "C999" not in text
+
+
+def test_render_prometheus_empty_stats_omits_watermark():
+    samples = _parse_prom(StreamStats().render_prometheus())
+    assert samples["fre_stream_received_total"] == 0
+    assert "fre_stream_watermark_step" not in samples
+
+
+def test_rule_hits_count_each_rule_once_per_event():
+    proc, results, _ = _collect()
+    proc.run([json.dumps(fraud_txn())])
+    codes = {h.code for h in results[0].rule_hits}
+    assert codes and proc.stats.rule_hits == dict.fromkeys(codes, 1)
+
+
+def test_write_metrics_textfile_is_atomic_and_cleans_up(tmp_path, monkeypatch):
+    target = tmp_path / "stream.prom"
+    stats = StreamStats(received=3)
+    write_metrics_textfile(stats, target)
+    assert "fre_stream_received_total 3" in target.read_text()
+    assert [p.name for p in tmp_path.iterdir()] == ["stream.prom"]
+
+    def boom(*_: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("fraud_engine.stream.os.replace", boom)
+    with pytest.raises(OSError, match="disk full"):
+        write_metrics_textfile(StreamStats(received=9), target)
+    # The previous file is intact and no temp file is left behind.
+    assert "fre_stream_received_total 3" in target.read_text()
+    assert [p.name for p in tmp_path.iterdir()] == ["stream.prom"]
+
+
+def test_metrics_writer_rewrites_every_n_messages(tmp_path):
+    target = tmp_path / "m.prom"
+    writer = MetricsTextfileWriter(target, every=2)
+    proc, _, _ = _collect(after_message=writer)
+    proc.process(_msg())
+    assert writer.writes == 0 and not target.exists()
+    proc.process(b"{bad")  # dead letters count as messages too
+    assert writer.writes == 1
+    assert _parse_prom(target.read_text())["fre_stream_received_total"] == 2
+    proc.process(_msg())
+    assert writer.writes == 1
+    writer.flush(proc.stats)
+    assert _parse_prom(target.read_text())["fre_stream_received_total"] == 3
+
+
+def test_metrics_writer_rejects_bad_interval(tmp_path):
+    with pytest.raises(ValueError):
+        MetricsTextfileWriter(tmp_path / "m.prom", every=0)
+
+
+def test_cli_writes_metrics_file(tmp_path, capsys):
+    src = tmp_path / "in.jsonl"
+    src.write_text("\n".join([json.dumps(make_txn()), "{bad", json.dumps(fraud_txn())]) + "\n")
+    prom = tmp_path / "stream.prom"
+    args = ["--input", str(src), "--metrics-file", str(prom), "--metrics-every", "2"]
+    assert main([*args, "--output", str(tmp_path / "out.jsonl")]) == 0
+    samples = _parse_prom(prom.read_text())
+    assert samples["fre_stream_received_total"] == 3
+    assert samples["fre_stream_scored_total"] == 2
+    stats = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+    assert stats["received"] == 3 and stats["watermark"] == 10
+
+
+def test_cli_flushes_metrics_even_when_sink_fails(tmp_path, monkeypatch):
+    class Broken(FakeProducer):
+        def produce(self, *a: Any, **k: Any) -> None:
+            raise BufferError("queue full")
+
+    monkeypatch.setattr("fraud_engine.stream.make_kafka_producer", lambda _b: Broken())
+    src = tmp_path / "in.jsonl"
+    src.write_text(json.dumps(make_txn()) + "\n")
+    prom = tmp_path / "stream.prom"
+    with pytest.raises(KafkaDeliveryError):
+        main(["--input", str(src), "--output-topic", "res", "--metrics-file", str(prom)])
+    assert _parse_prom(prom.read_text())["fre_stream_received_total"] == 1
+
+
+def test_cli_rejects_bad_metrics_interval(tmp_path):
+    src = tmp_path / "in.jsonl"
+    src.write_text("")
+    with pytest.raises(SystemExit):
+        main(["--input", str(src), "--metrics-every", "0"])

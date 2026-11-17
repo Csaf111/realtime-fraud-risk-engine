@@ -15,6 +15,10 @@ topic. This module is the transport-agnostic core of that mode:
 * ``KafkaTopicSink`` writes results (keyed by ``transaction_id``) and dead letters back
   to Kafka topics, confirming delivery before returning so the consumer only commits
   input offsets whose output is durably on the broker.
+* ``StreamStats.render_prometheus`` / ``write_metrics_textfile`` export the running
+  counters as ``fre_stream_*`` Prometheus metrics (``--metrics-file``), written atomically in
+  the node-exporter textfile-collector format so a batch replay or a consumer without an
+  HTTP port can still be scraped.
 * ``python -m fraud_engine.stream --input file.jsonl`` replays JSON lines through the
   processor and writes one result per line, handy for backfills and demos.
 
@@ -31,7 +35,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any, Protocol
@@ -75,8 +81,12 @@ class StreamStats:
     scored: int = 0
     dead_lettered: int = 0
     late: int = 0
+    committed: int = 0
+    broker_errors: int = 0
+    watermark: int | None = None
     decisions: dict[str, int] = field(default_factory=dict)
     dead_letter_reasons: dict[str, int] = field(default_factory=dict)
+    rule_hits: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -84,9 +94,114 @@ class StreamStats:
             "scored": self.scored,
             "dead_lettered": self.dead_lettered,
             "late": self.late,
+            "committed": self.committed,
+            "broker_errors": self.broker_errors,
+            "watermark": self.watermark,
             "decisions": dict(self.decisions),
             "dead_letter_reasons": dict(self.dead_letter_reasons),
+            "rule_hits": dict(self.rule_hits),
         }
+
+    def render_prometheus(self) -> str:
+        """Render the counters as Prometheus text exposition (``fre_stream_*``).
+
+        Label values are only decisions, dead-letter reason codes and rule codes, all
+        bounded sets defined by this code base. Nothing from the message itself (accounts,
+        amounts, transaction IDs) is ever exported, so cardinality stays fixed and no
+        customer data reaches the monitoring stack.
+        """
+        lines: list[str] = []
+
+        def counter(name: str, help_: str, value: int) -> None:
+            lines.extend([f"# HELP {name} {help_}", f"# TYPE {name} counter", f"{name} {value}"])
+
+        def labelled(name: str, help_: str, label: str, values: dict[str, int]) -> None:
+            lines.extend([f"# HELP {name} {help_}", f"# TYPE {name} counter"])
+            lines.extend(f'{name}{{{label}="{k}"}} {v}' for k, v in sorted(values.items()))
+
+        counter("fre_stream_received_total", "Messages received from the stream.", self.received)
+        counter("fre_stream_scored_total", "Messages validated and scored.", self.scored)
+        counter(
+            "fre_stream_dead_lettered_total", "Messages sent to dead letter.", self.dead_lettered
+        )
+        labelled(
+            "fre_stream_dead_letters_total",
+            "Dead letters by reason code.",
+            "reason",
+            self.dead_letter_reasons,
+        )
+        counter(
+            "fre_stream_late_total", "Events behind the step watermark (scored or not).", self.late
+        )
+        counter(
+            "fre_stream_committed_total", "Input offsets committed after handling.", self.committed
+        )
+        counter(
+            "fre_stream_broker_errors_total",
+            "Broker-level errors skipped without commit.",
+            self.broker_errors,
+        )
+        labelled(
+            "fre_stream_decisions_total",
+            "Scoring decisions by outcome.",
+            "decision",
+            self.decisions,
+        )
+        labelled("fre_stream_rule_hits_total", "Times each rule fired.", "rule", self.rule_hits)
+        if self.watermark is not None:
+            lines.extend(
+                [
+                    "# HELP fre_stream_watermark_step Highest PaySim step scored so far.",
+                    "# TYPE fre_stream_watermark_step gauge",
+                    f"fre_stream_watermark_step {self.watermark}",
+                ]
+            )
+        return "\n".join(lines) + "\n"
+
+
+def write_metrics_textfile(stats: StreamStats, path: str | os.PathLike[str]) -> None:
+    """Atomically write ``stats`` as a Prometheus textfile (node-exporter collector format).
+
+    The text is written to a temporary file in the same directory and renamed over
+    ``path``, so a scraper never reads a half-written file.
+    """
+    target = os.fspath(path)
+    directory = os.path.dirname(os.path.abspath(target))
+    fd, tmp = tempfile.mkstemp(prefix=".fre_stream_", suffix=".prom.tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(stats.render_prometheus())
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+class MetricsTextfileWriter:
+    """``after_message`` hook that rewrites a metrics textfile every ``every`` messages.
+
+    Call :meth:`flush` once at the end (the CLI does, even on failure) so the final
+    counters are always on disk.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, every: int = 1000) -> None:
+        if every < 1:
+            raise ValueError("every must be >= 1")
+        self.path = path
+        self.every = every
+        self.writes = 0
+        self._since = 0
+
+    def __call__(self, stats: StreamStats) -> None:
+        self._since += 1
+        if self._since >= self.every:
+            self.flush(stats)
+
+    def flush(self, stats: StreamStats) -> None:
+        write_metrics_textfile(stats, self.path)
+        self.writes += 1
+        self._since = 0
 
 
 ResultSink = Callable[[RiskResult], None]
@@ -109,6 +224,7 @@ class StreamProcessor:
         update_state: bool = True,
         allowed_lateness_steps: int | None = None,
         max_message_bytes: int = MAX_MESSAGE_BYTES,
+        after_message: Callable[[StreamStats], None] | None = None,
     ) -> None:
         if allowed_lateness_steps is not None and allowed_lateness_steps < 0:
             raise ValueError("allowed_lateness_steps must be >= 0")
@@ -120,8 +236,13 @@ class StreamProcessor:
         self.update_state = update_state
         self.allowed_lateness_steps = allowed_lateness_steps
         self.max_message_bytes = max_message_bytes
+        self.after_message = after_message
         self.stats = StreamStats()
-        self.watermark: int | None = None  # highest step scored so far
+
+    @property
+    def watermark(self) -> int | None:
+        """Highest step scored so far (``None`` before the first scored event)."""
+        return self.stats.watermark
 
     def _reject(self, reason: str, error: str, payload: str, offset: int) -> None:
         self.stats.dead_lettered += 1
@@ -130,6 +251,12 @@ class StreamProcessor:
 
     def process(self, raw: bytes | str, offset: int | None = None) -> RiskResult | None:
         """Score one message. Returns the result, or ``None`` if it was dead-lettered."""
+        result = self._process(raw, offset)
+        if self.after_message is not None:
+            self.after_message(self.stats)
+        return result
+
+    def _process(self, raw: bytes | str, offset: int | None) -> RiskResult | None:
         self.stats.received += 1
         pos = self.stats.received - 1 if offset is None else offset
 
@@ -172,10 +299,13 @@ class StreamProcessor:
                 return None
 
         result = self.engine.score(txn, update_state=self.update_state)
-        self.watermark = txn.step if self.watermark is None else max(self.watermark, txn.step)
+        wm = self.stats.watermark
+        self.stats.watermark = txn.step if wm is None else max(wm, txn.step)
         self.stats.scored += 1
         key = result.decision.value
         self.stats.decisions[key] = self.stats.decisions.get(key, 0) + 1
+        for code in {h.code for h in result.rule_hits}:
+            self.stats.rule_hits[code] = self.stats.rule_hits.get(code, 0) + 1
         self.sink(result)
         return result
 
@@ -232,9 +362,11 @@ def run_kafka(
         idle = 0
         if msg.error():
             log.warning("Kafka error: %s", msg.error())
+            processor.stats.broker_errors += 1
             continue
         processor.process(msg.value() or b"", offset=msg.offset())
         consumer.commit(message=msg, asynchronous=False)
+        processor.stats.committed += 1
         handled += 1
     return processor.stats
 
@@ -374,7 +506,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--delivery-timeout", type=float, default=10.0, metavar="SECONDS")
     p.add_argument("--allowed-lateness", type=int, default=None, metavar="STEPS")
     p.add_argument("--no-update-state", action="store_true", help="Score without recording")
+    p.add_argument(
+        "--metrics-file",
+        help="Write fre_stream_* Prometheus metrics here (textfile-collector format)",
+    )
+    p.add_argument(
+        "--metrics-every",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Rewrite --metrics-file every N messages (default 1000; always at exit)",
+    )
     args = p.parse_args(argv)
+    if args.metrics_every < 1:
+        p.error("--metrics-every must be >= 1")
     if args.output_topic and args.output:
         p.error("--output and --output-topic are mutually exclusive")
     if args.dead_letter_topic and args.dead_letter:
@@ -404,14 +549,20 @@ def main(argv: list[str] | None = None) -> int:
         dead_letter = lambda d: print(d.to_json(), file=dl_fh)  # noqa: E731
     else:
         dead_letter = None
+    metrics = (
+        MetricsTextfileWriter(args.metrics_file, every=args.metrics_every)
+        if args.metrics_file
+        else None
+    )
+    processor = StreamProcessor(
+        engine,
+        sink=sink,
+        dead_letter=dead_letter,
+        update_state=not args.no_update_state,
+        allowed_lateness_steps=args.allowed_lateness,
+        after_message=metrics,
+    )
     try:
-        processor = StreamProcessor(
-            engine,
-            sink=sink,
-            dead_letter=dead_letter,
-            update_state=not args.no_update_state,
-            allowed_lateness_steps=args.allowed_lateness,
-        )
         if args.input is not None:
             if args.input == "-":
                 stats = processor.run(_iter_lines(sys.stdin))
@@ -422,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
             consumer = make_kafka_consumer(args.kafka_bootstrap, args.kafka_topic, args.kafka_group)
             stats = run_kafka(processor, consumer)
     finally:
+        if metrics is not None:
+            metrics.flush(processor.stats)
         if out is not sys.stdout:
             out.close()
         if dl_fh is not None:
