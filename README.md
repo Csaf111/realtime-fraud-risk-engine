@@ -62,6 +62,9 @@ curl -s localhost:8000/v1/score -H 'content-type: application/json' \
 
 Or with Docker: `docker compose up --build`.
 
+Setting up on a new machine (macOS, Linux or Windows/WSL, from installing Python or Docker
+through training a model and smoke-testing it)? Follow [docs/local-setup.md](docs/local-setup.md).
+
 ## API
 
 Interactive docs live at `/docs` (Swagger) and `/redoc`.
