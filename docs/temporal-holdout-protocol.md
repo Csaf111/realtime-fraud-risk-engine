@@ -48,7 +48,9 @@ labels or amounts. Fractions refer to distinct time steps, not row counts.
 The planner uses distinct-step cut points, so actual row fractions can differ
 substantially from requested fractions when event density varies. The embargo
 excludes all records within the configured numeric step distance of either
-cut point. This deliberately sacrifices samples to reduce boundary leakage.
+cut point when `embargo_steps > 0`. Setting `embargo_steps=0` disables the
+embargo completely: no boundary records are dropped. This is useful for
+controlled comparisons, but should not be interpreted as leakage protection. This deliberately sacrifices samples to reduce boundary leakage.
 
 This utility does not train a model, calculate metrics, verify feature parity,
 or validate that a historical balance was observable at authorisation time.
