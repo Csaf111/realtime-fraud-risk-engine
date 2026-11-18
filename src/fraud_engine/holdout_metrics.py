@@ -8,6 +8,7 @@ from __future__ import annotations
 from math import ceil, isfinite
 from typing import Sequence
 
+from .average_precision import average_precision
 from .temporal_holdout import HoldoutSplit
 
 
@@ -48,6 +49,7 @@ def evaluate_partition(
             "recall": caught / fraud if fraud else 0.0,
         }
     return {"records": len(indices), "fraud_records": fraud, "prevalence": fraud / len(indices),
+            "average_precision": average_precision(scores, labels, indices),
             "alert_budgets": results}
 
 
