@@ -3,8 +3,8 @@
 `fraud_engine.stream` scores transactions from a log (Kafka today, any ordered source in
 principle) instead of HTTP requests. It is a **skeleton**: the processing core,
 dead-lettering, ordering policy, an at-least-once Kafka loop and Kafka output/dead-letter
-topics and Prometheus metrics export are implemented and tested; rebalance hooks are not
-yet (see "Not done yet").
+topics, Prometheus metrics export and consumer-group rebalance hooks are implemented and
+tested (see "Not done yet" for what remains).
 
 ```mermaid
 flowchart LR
@@ -74,6 +74,8 @@ python -m fraud_engine.stream --kafka-topic transactions --output-topic risk-res
 | `fre_stream_decisions_total{decision}` | counter | `APPROVE` / `REVIEW` / `BLOCK` |
 | `fre_stream_rule_hits_total{rule}` | counter | Times each rule fired (once per event) |
 | `fre_stream_watermark_step` | gauge | Highest PaySim step scored so far (absent before the first) |
+| `fre_stream_rebalances_total{event}` | counter | Rebalance callbacks: `assign`, `revoke`, `lost` |
+| `fre_stream_assigned_partitions` | gauge | Input partitions currently assigned (absent before the first assignment) |
 
 Labels are only decisions, reason codes and rule codes, so cardinality is fixed and no
 account, amount or transaction ID ever reaches the monitoring stack. Useful alerts:
@@ -107,6 +109,44 @@ to stderr as JSON at exit.
   downstream consumer can drop duplicates from redelivery. Flushing per record costs
   throughput; batching would need commit-after-batch-flush and is left for later.
 
+## Consumer-group rebalances
+
+In Kafka mode the CLI subscribes with a `RebalanceListener`, whose `on_assign` / `on_revoke` /
+`on_lost` hooks the client calls from inside `poll()` (between messages, never mid-message):
+
+- **Revoke / lost: flush before hand-over.** Offsets are already committed synchronously after
+  every message, so there is nothing uncommitted to save; the hook flushes side outputs (the
+  `--metrics-file`) so they are durable at the hand-over point. A failing flush is logged and
+  counted, never raised: an exception inside the client callback would abort the rebalance
+  and stall the group. `on_lost` (partitions taken without a clean revoke, e.g. a session
+  timeout) is handled the same way; another replica may re-score messages whose commit
+  failed, which is why sinks must be idempotent on `transaction_id`.
+- **Assign: reset the step watermark.** The watermark is per process, but Kafka only orders
+  within a partition. Without a reset, a newly assigned partition that lags behind would be
+  judged "late" against another partition's progress and, with `--allowed-lateness`, its events
+  dead-lettered. Lateness is measured again from the next event. Re-sent assignments of
+  partitions already held (eager protocol) do not reset it. Library users can opt out with
+  `RebalanceListener(..., reset_watermark_on_assign=False)`.
+- **Velocity state warning.** The default in-process `VelocityStore` only knows events this
+  replica scored, so accounts on newly assigned partitions start with empty velocity, which
+  offline replay never produces. The listener logs a warning once; run consumer groups with
+  `FRE_VELOCITY_BACKEND=redis` so every replica reads the same history.
+- **Metrics.** `fre_stream_rebalances_total{event}` and `fre_stream_assigned_partitions`; topic
+  names and partition numbers are never exported as labels.
+
+```python
+from fraud_engine.stream import RebalanceListener, StreamProcessor, run_kafka
+
+listener = RebalanceListener(processor, flush=[lambda: metrics.flush(processor.stats)])
+consumer.subscribe(
+    ["transactions"],
+    on_assign=listener.on_assign,
+    on_revoke=listener.on_revoke,
+    on_lost=listener.on_lost,
+)
+run_kafka(processor, consumer)
+```
+
 ## Ordering and leakage
 
 Offline training replays rows sorted by `step`, so a stream only reproduces training features
@@ -125,5 +165,6 @@ The `late` counter makes that skew visible.
 
 ## Not done yet
 
-- Consumer-group rebalancing hooks and shared velocity state across partitions.
+- Per-partition watermarks (today one watermark per process, reset on assignment).
+- Waiting for in-flight async commits on revoke (not needed while commits are synchronous).
 - Consumer lag (needs broker high-watermarks from the client) in the metrics file.

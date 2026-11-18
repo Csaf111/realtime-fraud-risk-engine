@@ -13,8 +13,10 @@ from fraud_engine.stream import (
     KafkaDeliveryError,
     KafkaTopicSink,
     MetricsTextfileWriter,
+    RebalanceListener,
     StreamProcessor,
     StreamStats,
+    build_rebalance_listener,
     main,
     run_kafka,
     write_metrics_textfile,
@@ -507,3 +509,148 @@ def test_cli_rejects_bad_metrics_interval(tmp_path):
     src.write_text("")
     with pytest.raises(SystemExit):
         main(["--input", str(src), "--metrics-every", "0"])
+
+
+# --- Rebalance hooks -------------------------------------------------------------------
+
+
+class TP:
+    def __init__(self, topic: str, partition: int) -> None:
+        self.topic, self.partition = topic, partition
+
+
+class RebalancingConsumer(FakeConsumer):
+    """Fires rebalance callbacks from inside poll(), like confluent-kafka does."""
+
+    def __init__(self, items: list[Any], listener: RebalanceListener) -> None:
+        super().__init__(items)
+        self.listener = listener
+
+    def poll(self, timeout: float) -> FakeMsg | None:
+        while self.items and isinstance(self.items[0], tuple):
+            event, parts = self.items.pop(0)
+            getattr(self.listener, f"on_{event}")(self, parts)
+        return super().poll(timeout)
+
+
+def test_assign_resets_watermark_so_lagging_partition_is_not_dead_lettered():
+    proc, results, dead = _collect(allowed_lateness_steps=0)
+    listener = RebalanceListener(proc)
+    consumer = RebalancingConsumer(
+        [
+            ("assign", [TP("txns", 0)]),
+            FakeMsg(_msg(step=50, transaction_id="p0"), 1),
+            ("assign", [TP("txns", 1)]),  # incremental: a partition that lags behind
+            FakeMsg(_msg(step=10, transaction_id="p1"), 1),
+            FakeMsg(_msg(step=5, transaction_id="p1-late"), 2),  # genuinely late after that
+        ],
+        listener,
+    )
+    stats = run_kafka(proc, consumer, max_idle_polls=1)
+    assert [r.transaction_id for r in results] == ["p0", "p1"]
+    assert [d.reason for d in dead] == ["late"]
+    assert stats.rebalances == {"assign": 2}
+    assert stats.assigned_partitions == 2
+    assert listener.assignment == {("txns", 0), ("txns", 1)}
+    assert stats.committed == 3
+
+
+def test_watermark_kept_when_reset_disabled():
+    proc, _, dead = _collect(allowed_lateness_steps=0)
+    listener = RebalanceListener(proc, reset_watermark_on_assign=False)
+    listener.on_assign(None, [TP("t", 0)])
+    proc.process(_msg(step=50))
+    listener.on_assign(None, [TP("t", 1)])
+    proc.process(_msg(step=10))
+    assert proc.watermark == 50
+    assert [d.reason for d in dead] == ["late"]
+
+
+def test_reassigning_known_partitions_does_not_reset_watermark():
+    proc, _, _ = _collect()
+    listener = RebalanceListener(proc)
+    listener.on_assign(None, [TP("t", 0)])
+    proc.process(_msg(step=7))
+    listener.on_assign(None, [TP("t", 0)])  # eager protocol re-sends the full assignment
+    assert proc.watermark == 7
+    assert proc.stats.assigned_partitions == 1
+
+
+def test_revoke_and_lost_flush_and_shrink_assignment():
+    proc, _, _ = _collect()
+    flushed: list[str] = []
+    listener = RebalanceListener(proc, flush=[lambda: flushed.append("x")])
+    listener.on_assign(None, [TP("t", 0), TP("t", 1), TP("t", 2)])
+    listener.on_revoke(None, [TP("t", 0)])
+    assert flushed == ["x"]
+    assert proc.stats.assigned_partitions == 2
+    listener.on_lost(None, [TP("t", 1), TP("t", 2)])
+    assert flushed == ["x", "x"]
+    assert proc.stats.assigned_partitions == 0
+    assert proc.stats.rebalances == {"assign": 1, "revoke": 1, "lost": 1}
+    assert listener.assignment == set()
+
+
+def test_flush_failure_is_contained_and_counted(caplog):
+    proc, _, _ = _collect()
+    calls: list[int] = []
+
+    def boom() -> None:
+        raise OSError("disk full")
+
+    listener = RebalanceListener(proc, flush=[boom, lambda: calls.append(1)])
+    listener.on_revoke(None, [TP("t", 0)])  # must not raise into the Kafka client
+    assert listener.flush_errors == 1
+    assert calls == [1]  # later callbacks still run
+    assert "flush during rebalance failed" in caplog.text
+
+
+def test_local_state_warning_logged_once(caplog):
+    proc, _, _ = _collect()
+    listener = RebalanceListener(proc)
+    with caplog.at_level("WARNING", logger="fraud_engine.stream"):
+        listener.on_assign(None, [TP("t", 0)])
+        listener.on_assign(None, [TP("t", 1)])
+    assert caplog.text.count("in-process VelocityStore") == 1
+
+
+def test_no_local_state_warning_with_shared_store(caplog):
+    import fakeredis
+
+    from fraud_engine.state_redis import RedisVelocityStore
+
+    store = RedisVelocityStore(fakeredis.FakeRedis(), window_steps=24)
+    proc = StreamProcessor(RiskEngine(store=store), lambda r: None)
+    with caplog.at_level("WARNING", logger="fraud_engine.stream"):
+        RebalanceListener(proc).on_assign(None, [TP("t", 0)])
+    assert "VelocityStore" not in caplog.text
+
+
+def test_rebalance_metrics_rendered_without_topic_names():
+    proc, _, _ = _collect()
+    listener = RebalanceListener(proc)
+    listener.on_assign(None, [TP("secret-topic", 0), TP("secret-topic", 1)])
+    listener.on_revoke(None, [TP("secret-topic", 1)])
+    text = proc.stats.render_prometheus()
+    samples = _parse_prom(text)
+    assert samples['fre_stream_rebalances_total{event="assign"}'] == 1
+    assert samples['fre_stream_rebalances_total{event="revoke"}'] == 1
+    assert samples["fre_stream_assigned_partitions"] == 1
+    assert "secret-topic" not in text
+    assert proc.stats.as_dict()["assigned_partitions"] == 1
+    assert "fre_stream_assigned_partitions" not in _parse_prom(StreamStats().render_prometheus())
+
+
+def test_cli_rebalance_listener_flushes_metrics_file(tmp_path):
+    proc, _, _ = _collect()
+    path = tmp_path / "m.prom"
+    writer = MetricsTextfileWriter(path, every=10_000)
+    listener = build_rebalance_listener(proc, writer)
+    listener.on_assign(None, [TP("t", 0)])
+    proc.process(_msg())
+    assert not path.exists()
+    listener.on_revoke(None, [TP("t", 0)])
+    text = path.read_text()
+    assert "fre_stream_received_total 1" in text
+    assert 'fre_stream_rebalances_total{event="revoke"} 1' in text
+    assert build_rebalance_listener(proc, None).flush_callbacks == []

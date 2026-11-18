@@ -19,6 +19,11 @@ topic. This module is the transport-agnostic core of that mode:
   counters as ``fre_stream_*`` Prometheus metrics (``--metrics-file``), written atomically in
   the node-exporter textfile-collector format so a batch replay or a consumer without an
   HTTP port can still be scraped.
+* ``RebalanceListener`` plugs into the consumer group's ``on_assign`` / ``on_revoke`` /
+  ``on_lost`` callbacks: it flushes pending output and metrics before partitions are handed
+  away, resets the step watermark when new partitions arrive (so a lagging partition is not
+  dead-lettered as "late" against another partition's progress) and exports rebalance
+  counters and the assigned-partition gauge.
 * ``python -m fraud_engine.stream --input file.jsonl`` replays JSON lines through the
   processor and writes one result per line, handy for backfills and demos.
 
@@ -87,6 +92,8 @@ class StreamStats:
     decisions: dict[str, int] = field(default_factory=dict)
     dead_letter_reasons: dict[str, int] = field(default_factory=dict)
     rule_hits: dict[str, int] = field(default_factory=dict)
+    rebalances: dict[str, int] = field(default_factory=dict)
+    assigned_partitions: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +107,8 @@ class StreamStats:
             "decisions": dict(self.decisions),
             "dead_letter_reasons": dict(self.dead_letter_reasons),
             "rule_hits": dict(self.rule_hits),
+            "rebalances": dict(self.rebalances),
+            "assigned_partitions": self.assigned_partitions,
         }
 
     def render_prometheus(self) -> str:
@@ -148,6 +157,20 @@ class StreamStats:
             self.decisions,
         )
         labelled("fre_stream_rule_hits_total", "Times each rule fired.", "rule", self.rule_hits)
+        labelled(
+            "fre_stream_rebalances_total",
+            "Consumer-group rebalance callbacks by event (assign, revoke, lost).",
+            "event",
+            self.rebalances,
+        )
+        if self.assigned_partitions is not None:
+            lines.extend(
+                [
+                    "# HELP fre_stream_assigned_partitions Input partitions currently assigned.",
+                    "# TYPE fre_stream_assigned_partitions gauge",
+                    f"fre_stream_assigned_partitions {self.assigned_partitions}",
+                ]
+            )
         if self.watermark is not None:
             lines.extend(
                 [
@@ -243,6 +266,10 @@ class StreamProcessor:
     def watermark(self) -> int | None:
         """Highest step scored so far (``None`` before the first scored event)."""
         return self.stats.watermark
+
+    def reset_watermark(self) -> None:
+        """Forget the step watermark (lateness is then judged from the next event on)."""
+        self.stats.watermark = None
 
     def _reject(self, reason: str, error: str, payload: str, offset: int) -> None:
         self.stats.dead_lettered += 1
@@ -371,6 +398,117 @@ def run_kafka(
     return processor.stats
 
 
+class TopicPartitionLike(Protocol):
+    @property
+    def topic(self) -> str: ...
+    @property
+    def partition(self) -> int: ...
+
+
+class RebalanceListener:
+    """Consumer-group rebalance hooks for ``run_kafka`` (confluent-kafka ``subscribe`` style).
+
+    Pass ``on_assign`` / ``on_revoke`` / ``on_lost`` to ``consumer.subscribe``; the client
+    calls them from inside ``poll()``, i.e. between messages, never mid-message.
+
+    * **Revoke / lost:** every ``flush`` callback runs (e.g. the metrics textfile writer)
+      before the partitions move to another replica. ``run_kafka`` commits synchronously
+      after each message, so there is never an uncommitted, already-handled offset to save;
+      the hook exists so side outputs are durable at the hand-over point. A flush failure
+      is logged and counted, never raised: raising inside the client callback would abort
+      the rebalance and stall the whole group.
+    * **Assign:** the step watermark is reset (``reset_watermark_on_assign``). The
+      watermark is global to the process while Kafka only orders within a partition, so a
+      newly assigned partition that lags behind would otherwise have its events judged
+      "late" against another partition's progress and, with ``--allowed-lateness``,
+      dead-lettered. Lateness is then measured again from the next event.
+    * **State warning:** an in-process ``VelocityStore`` only holds history for events this
+      replica has scored. After a rebalance, accounts on newly assigned partitions start
+      with empty velocity, which offline training never sees. A warning is logged once;
+      use ``FRE_VELOCITY_BACKEND=redis`` for a shared store across replicas.
+
+    Rebalances are counted in ``stats.rebalances`` (``fre_stream_rebalances_total{event}``)
+    and the current assignment size in ``stats.assigned_partitions``
+    (``fre_stream_assigned_partitions``). Topic names and partition numbers are not
+    exported as labels.
+    """
+
+    def __init__(
+        self,
+        processor: StreamProcessor,
+        *,
+        flush: Iterable[Callable[[], None]] = (),
+        reset_watermark_on_assign: bool = True,
+    ) -> None:
+        self.processor = processor
+        self.flush_callbacks = list(flush)
+        self.reset_watermark_on_assign = reset_watermark_on_assign
+        self.assignment: set[tuple[str, int]] = set()
+        self.flush_errors = 0
+        self._warned_local_state = False
+
+    @staticmethod
+    def _keys(partitions: Iterable[TopicPartitionLike]) -> set[tuple[str, int]]:
+        return {(tp.topic, tp.partition) for tp in partitions}
+
+    def _count(self, event: str) -> None:
+        r = self.processor.stats.rebalances
+        r[event] = r.get(event, 0) + 1
+
+    def _publish_assignment(self) -> None:
+        self.processor.stats.assigned_partitions = len(self.assignment)
+
+    def _flush(self) -> None:
+        for callback in self.flush_callbacks:
+            try:
+                callback()
+            except Exception:  # never abort a rebalance from inside the client callback
+                self.flush_errors += 1
+                log.exception("flush during rebalance failed")
+
+    def _warn_if_local_state(self) -> None:
+        from .state import VelocityStore
+
+        if self._warned_local_state or not isinstance(self.processor.engine.store, VelocityStore):
+            return
+        self._warned_local_state = True
+        log.warning(
+            "Partitions assigned with an in-process VelocityStore: accounts on newly assigned "
+            "partitions start with empty velocity history. Use FRE_VELOCITY_BACKEND=redis to "
+            "share state across consumer replicas."
+        )
+
+    def on_assign(self, consumer: Any, partitions: list[TopicPartitionLike]) -> None:
+        added = self._keys(partitions) - self.assignment
+        self.assignment |= added
+        self._count("assign")
+        self._publish_assignment()
+        if added and self.reset_watermark_on_assign:
+            self.processor.reset_watermark()
+        if added:
+            self._warn_if_local_state()
+        log.info("assigned %d partition(s), now %d", len(added), len(self.assignment))
+
+    def _release(self, event: str, partitions: list[TopicPartitionLike]) -> None:
+        self.assignment -= self._keys(partitions)
+        self._count(event)
+        self._publish_assignment()
+        self._flush()  # after counting, so the flushed metrics include this hand-over
+        log.info("%s %d partition(s), now %d", event, len(partitions), len(self.assignment))
+
+    def on_revoke(self, consumer: Any, partitions: list[TopicPartitionLike]) -> None:
+        self._release("revoke", partitions)
+
+    def on_lost(self, consumer: Any, partitions: list[TopicPartitionLike]) -> None:
+        """Partitions were taken away without a clean revoke (e.g. session timeout).
+
+        Another replica may already be processing them, so the at-least-once guarantee
+        means it can re-score messages this replica handled but whose commit failed;
+        sinks must stay idempotent on ``transaction_id``.
+        """
+        self._release("lost", partitions)
+
+
 class KafkaDeliveryError(RuntimeError):
     """A record could not be confirmed as delivered to its output topic."""
 
@@ -454,7 +592,7 @@ def make_kafka_producer(bootstrap: str) -> KafkaProducerLike:  # pragma: no cove
 
 
 def make_kafka_consumer(  # pragma: no cover - needs the optional client and a broker
-    bootstrap: str, topic: str, group_id: str
+    bootstrap: str, topic: str, group_id: str, rebalance: RebalanceListener | None = None
 ) -> KafkaConsumerLike:
     """Build a confluent-kafka consumer. Requires ``pip install confluent-kafka``."""
     try:
@@ -471,7 +609,15 @@ def make_kafka_consumer(  # pragma: no cover - needs the optional client and a b
             "auto.offset.reset": "earliest",
         }
     )
-    consumer.subscribe([topic])
+    if rebalance is None:
+        consumer.subscribe([topic])
+    else:
+        consumer.subscribe(
+            [topic],
+            on_assign=rebalance.on_assign,
+            on_revoke=rebalance.on_revoke,
+            on_lost=rebalance.on_lost,
+        )
     return consumer
 
 
@@ -485,6 +631,16 @@ def _iter_lines(fh: IO[str]) -> Iterator[str]:
         line = line.strip()
         if line:
             yield line
+
+
+def build_rebalance_listener(
+    processor: StreamProcessor, metrics: MetricsTextfileWriter | None
+) -> RebalanceListener:
+    """The CLI's rebalance hooks: flush the metrics textfile on every hand-over."""
+    flush: list[Callable[[], None]] = []
+    if metrics is not None:
+        flush.append(lambda: metrics.flush(processor.stats))
+    return RebalanceListener(processor, flush=flush)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -570,7 +726,10 @@ def main(argv: list[str] | None = None) -> int:
                 with open(args.input) as fh:
                     stats = processor.run(_iter_lines(fh))
         else:  # pragma: no cover - needs a broker
-            consumer = make_kafka_consumer(args.kafka_bootstrap, args.kafka_topic, args.kafka_group)
+            listener = build_rebalance_listener(processor, metrics)
+            consumer = make_kafka_consumer(
+                args.kafka_bootstrap, args.kafka_topic, args.kafka_group, listener
+            )
             stats = run_kafka(processor, consumer)
     finally:
         if metrics is not None:
