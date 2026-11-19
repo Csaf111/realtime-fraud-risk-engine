@@ -199,10 +199,30 @@ omitted until defined. A recall alert:
     summary: "Labelled recall of REVIEW+BLOCK has dropped"
 ```
 
-Labels are used **only** for these metrics: they never reach features, rules, the model or
+Labels are used **only** for these metrics (and the optional feedback log below): they never reach features, rules, the model or
 the velocity store, so posting one cannot change a later score (tested). State is per
 replica: send labels to the replica that scored the transaction, or sum
 `fre_labelled_outcomes_total` across replicas in Prometheus to compute cluster-wide rates.
+
+#### Feedback log for retraining
+
+Set `FRE_FEEDBACK_LOG_PATH` and every label that joins a served decision also appends one
+JSON line holding the **served** point-in-time feature vector, the label and metadata:
+
+```json
+{"schema":1,"transaction_id":"demo-fraud-001","step":7,"model_version":"rules-v0.1.0+...",
+ "risk_score":0.91,"decision":"BLOCK","is_fraud":true,"features":{"log_amount":12.43,...}}
+```
+
+Because the features are the exact values the engine scored with (frozen before the label
+existed), a retrain on this log has online/offline parity by construction.
+`fraud_engine.feedback.read_feedback` validates each line (schema version, feature set equal
+to `FEATURE_NAMES`, finite values) and `feedback_dataset` returns time-ordered, id-deduped
+`(X, y, steps)`; ids, `step`, score and decision are metadata and never enter `X`. Writes
+are best-effort: failures increment `fre_feedback_write_errors_total` and never fail
+`/v1/labels`; successes count in `fre_feedback_records_total`. Without the setting, no
+features are retained in memory. With several replicas, give each its own file and
+concatenate (`feedback_dataset` dedupes by id).
 
 ### Request
 
@@ -446,6 +466,7 @@ make lint typecheck
 | `test_thresholds.py` | Alert-budget threshold selection: ties, saturation, ordering, test-window evaluation |
 | `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
 | `test_outcomes.py` | Delayed-label join: matched/unknown/duplicate, bounded buffers, rolling precision/recall, `/v1/labels`, labels never change later scores |
+| `test_feedback.py` | Feedback log: record round-trip and contract validation, time-ordered deduped dataset without metadata, best-effort writes, logged vector equals the online features end to end |
 | `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
@@ -501,6 +522,7 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_SHADOW_MODEL_PATH` | unset | Candidate model scored in shadow mode: same features, never affects the response; compared via `fre_shadow_*` metrics |
 | `FRE_LABEL_PENDING_CAPACITY` | `100000` | Served decisions kept awaiting a delayed label (`0` disables `/v1/labels`) |
 | `FRE_LABEL_WINDOW` | `5000` | Labelled outcomes in the rolling precision/recall window |
+| `FRE_FEEDBACK_LOG_PATH` | unset | JSONL file of served features joined to delayed labels, for retraining |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -525,6 +547,7 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── drift.py           Score reference + rolling PSI drift monitor
 │   ├── feature_drift.py   Per-feature quantile reference + rolling feature PSI
 │   ├── outcomes.py        Delayed-label join + rolling precision/recall
+│   ├── feedback.py        Labelled feedback log (served features + label) for retraining
 │   └── config.py          FRE_* settings
 ├── tests/                 Unit, leakage and API tests
 ├── docs/                  Dataset, leakage plan, architecture, CI/CD
@@ -547,6 +570,8 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Label-delayed performance monitoring (`POST /v1/labels`, `fre_label_precision` / `fre_label_recall`)
 - [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
 - [ ] Delayed-label feedback loop
+  - [x] Capture: served features joined to delayed labels in a JSONL log (`FRE_FEEDBACK_LOG_PATH`, `read_feedback` / `feedback_dataset`)
+  - [ ] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model
 
 ## Acknowledgements
 
