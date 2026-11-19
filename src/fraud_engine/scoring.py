@@ -54,6 +54,17 @@ class ShadowResult:
         return self.decision == self.primary_decision
 
 
+@dataclass(frozen=True)
+class ScoredTransaction:
+    """Everything one scoring call produced. ``features`` are the point-in-time inputs
+    (computed before the event was recorded) and are internal: never in the API response."""
+
+    result: RiskResult
+    shadow: ShadowResult | None
+    features: Mapping[str, float]
+    step: int
+
+
 class RiskEngine:
     def __init__(
         self,
@@ -113,6 +124,13 @@ class RiskEngine:
         self, txn: Transaction | Mapping[str, Any], update_state: bool = True
     ) -> tuple[RiskResult, ShadowResult | None]:
         """Score a transaction; also return the shadow model's verdict when one is loaded."""
+        scored = self.score_detailed(txn, update_state=update_state)
+        return scored.result, scored.shadow
+
+    def score_detailed(
+        self, txn: Transaction | Mapping[str, Any], update_state: bool = True
+    ) -> ScoredTransaction:
+        """Score a transaction and return the result, shadow verdict and served features."""
         start = time.perf_counter()
         data: Mapping[str, Any] = txn.model_dump() if isinstance(txn, Transaction) else txn
 
@@ -170,7 +188,7 @@ class RiskEngine:
         shadow = None
         if self.shadow_model is not None:
             shadow = self._score_shadow(self.shadow_model, features, rules_score, result.decision)
-        return result, shadow
+        return ScoredTransaction(result, shadow, features, int(data["step"]))
 
     def _observe_features(self, features: Mapping[str, float]) -> None:
         assert self.feature_observer is not None

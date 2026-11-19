@@ -16,6 +16,7 @@ from . import __version__
 from .config import Settings
 from .drift import DriftMonitor, ScoreReference
 from .feature_drift import FeatureDriftMonitor, FeatureReference
+from .feedback import FeedbackLog
 from .metrics import Metrics
 from .outcomes import LabelStatus, OutcomeTracker
 from .schemas import (
@@ -26,20 +27,23 @@ from .schemas import (
     RiskResult,
     Transaction,
 )
-from .scoring import RiskEngine, ShadowResult
+from .scoring import RiskEngine, ScoredTransaction
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("fraud_engine.api")
 
 
-def _observe(
-    m: Metrics,
-    result: RiskResult,
-    shadow: ShadowResult | None = None,
-    served: bool = True,
-) -> None:
+def _observe(m: Metrics, scored: ScoredTransaction, served: bool = True) -> None:
+    result, shadow = scored.result, scored.shadow
     if served and m.outcomes is not None:
-        m.outcomes.record_decision(result.transaction_id, result.risk_score, result.decision.value)
+        m.outcomes.record_decision(
+            result.transaction_id,
+            result.risk_score,
+            result.decision.value,
+            features=scored.features,
+            step=scored.step,
+            model_version=result.model_version,
+        )
     m.observe(
         result.decision.value,
         result.latency_ms,
@@ -82,7 +86,13 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         app.state.metrics = Metrics(
             drift=_drift_monitor(settings),
             feature_drift=feature_drift,
-            outcomes=OutcomeTracker(settings.label_pending_capacity, settings.label_window),
+            outcomes=OutcomeTracker(
+                settings.label_pending_capacity,
+                settings.label_window,
+                feedback=(
+                    FeedbackLog(settings.feedback_log_path) if settings.feedback_log_path else None
+                ),
+            ),
         )
         log.info(
             "Engine ready: mode=%s version=%s env=%s",
@@ -135,9 +145,9 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         eng: RiskEngine = request.app.state.engine
         m: Metrics = request.app.state.metrics
         m.request("score")
-        result, shadow = eng.score_with_shadow(txn)
-        _observe(m, result, shadow)
-        return result
+        scored = eng.score_detailed(txn)
+        _observe(m, scored)
+        return scored.result
 
     @app.post("/v1/score/batch", response_model=BatchResponse, tags=["scoring"])
     def score_batch(batch: BatchRequest, request: Request) -> BatchResponse:
@@ -152,18 +162,19 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         m.request("score_batch")
         results = []
         for t in batch.transactions:
-            r, shadow = eng.score_with_shadow(t, update_state=batch.update_state)
+            scored = eng.score_detailed(t, update_state=batch.update_state)
             # What-if scoring (update_state=False) is not a served decision: don't join labels.
-            _observe(m, r, shadow, served=batch.update_state)
-            results.append(r)
+            _observe(m, scored, served=batch.update_state)
+            results.append(scored.result)
         return BatchResponse(results=results, count=len(results))
 
     @app.post("/v1/labels", response_model=LabelBatchResponse, tags=["monitoring"])
     def post_labels(batch: LabelBatch, request: Request) -> LabelBatchResponse:
         """Report delayed fraud outcomes for previously scored transactions.
 
-        Labels feed only the ``fre_label_*`` performance metrics. They never change features,
-        rules, the model or velocity state, so they cannot leak into later scores.
+        Labels feed only the ``fre_label_*`` performance metrics and, when
+        ``FRE_FEEDBACK_LOG_PATH`` is set, the offline retraining log. They never change
+        features, rules, the model or velocity state, so they cannot leak into later scores.
         """
         if len(batch.labels) > settings.max_batch_size:
             raise HTTPException(
