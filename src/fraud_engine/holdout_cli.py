@@ -1,8 +1,7 @@
-"""CLI to evaluate *existing* point-in-time scores on a temporal PaySim holdout.
+"""CLI to evaluate supplied point-in-time scores on a temporal PaySim holdout.
 
-Input is a CSV with step, score, isFraud columns. Scores must have been generated
-without labels, post-event fields, or future velocity. This utility cannot verify
-the provenance of supplied scores.
+The CSV must contain step, score and isFraud. This tool validates input shape
+but cannot prove that the supplied scores were generated without leakage.
 """
 from __future__ import annotations
 
@@ -24,14 +23,26 @@ def evaluate_csv(
     steps: list[int] = []
     scores: list[float] = []
     labels: list[int] = []
-    with path.open(newline="", encoding="utf-8") as stream:
-        reader = csv.DictReader(stream)
+    with path.open(newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream, restkey="__extra_columns__")
         required = {"step", "score", "isFraud"}
-        if not reader.fieldnames or not required.issubset(reader.fieldnames):
-            raise ValueError(f"missing columns: {sorted(required - set(reader.fieldnames or []))}")
+        headers = reader.fieldnames or []
+        if len(headers) != len(set(headers)):
+            raise ValueError("duplicate CSV column names")
+        if "__extra_columns__" in headers:
+            raise ValueError("reserved CSV column name: __extra_columns__")
+        if not required.issubset(headers):
+            raise ValueError(f"missing columns: {sorted(required - set(headers))}")
         for row_number, row in enumerate(reader, start=2):
             try:
-                step = int(row["step"])
+                if row.get("__extra_columns__") is not None:
+                    raise ValueError("more values than CSV headers")
+                if any(value is None for value in row.values()):
+                    raise ValueError("missing CSV field value")
+                step_text = row["step"]
+                if not step_text or not step_text.isascii() or not step_text.isdecimal():
+                    raise ValueError("step must be a nonnegative decimal integer")
+                step = int(step_text)
                 score = float(row["score"])
                 label_text = row["isFraud"]
                 if label_text not in ("0", "1"):
@@ -41,7 +52,7 @@ def evaluate_csv(
                 steps.append(step)
                 scores.append(score)
                 labels.append(int(label_text))
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(f"invalid row {row_number}: {exc}") from exc
     split = chronological_holdout(
         steps, train_fraction=train_fraction,
