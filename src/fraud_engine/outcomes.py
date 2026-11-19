@@ -23,6 +23,11 @@ State is per replica and in memory. Route labels to the replica that scored the 
 (or aggregate the counters in Prometheus, which works because they are plain sums); a
 label for an unknown or evicted id is counted as ``unknown`` and ignored.
 
+Optional feedback loop: when a :class:`~fraud_engine.feedback.FeedbackLog` is attached,
+the tracker also keeps the served point-in-time feature dict (plus ``step`` and model
+version) with each pending decision and, on a match, appends the labelled record to the log
+for the next retrain. Without a log, nothing beyond ``(risk_score, decision)`` is stored.
+
 Pure Python and stdlib only, so it adds nothing to the serving image.
 """
 
@@ -30,8 +35,11 @@ from __future__ import annotations
 
 import threading
 from collections import Counter, OrderedDict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+from .feedback import FeedbackLog, FeedbackRecord
 
 ALERT_DECISIONS = frozenset({"REVIEW", "BLOCK"})
 
@@ -50,6 +58,16 @@ class RateSnapshot:
     recall: float | None
 
 
+@dataclass(frozen=True)
+class _Pending:
+    risk_score: float
+    decision: str
+    # Only populated when a feedback log is attached.
+    features: Mapping[str, float] | None = None
+    step: int | None = None
+    model_version: str | None = None
+
+
 def _ratio(num: int, den: int) -> float | None:
     return num / den if den else None
 
@@ -62,16 +80,23 @@ class OutcomeTracker:
             (counted in :attr:`evicted`), so memory stays bounded however many labels never
             arrive. ``0`` disables tracking entirely.
         window: number of most recent labelled outcomes used for precision/recall.
+        feedback: optional sink for labelled ``(features, label)`` records.
     """
 
-    def __init__(self, pending_capacity: int = 100_000, window: int = 5000) -> None:
+    def __init__(
+        self,
+        pending_capacity: int = 100_000,
+        window: int = 5000,
+        feedback: FeedbackLog | None = None,
+    ) -> None:
         if pending_capacity < 0:
             raise ValueError("pending_capacity must be >= 0")
         if window < 1:
             raise ValueError("window must be >= 1")
         self.pending_capacity = pending_capacity
         self.window = window
-        self._pending: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        self.feedback = feedback
+        self._pending: OrderedDict[str, _Pending] = OrderedDict()
         # Bounded memory of ids already labelled, so a retried label is a duplicate rather
         # than "unknown" and is never double-counted.
         self._labelled_ids: OrderedDict[str, None] = OrderedDict()
@@ -85,15 +110,32 @@ class OutcomeTracker:
     def enabled(self) -> bool:
         return self.pending_capacity > 0
 
-    def record_decision(self, transaction_id: str | None, risk_score: float, decision: str) -> None:
-        """Remember a served decision until its label arrives. Ids are required to join."""
+    def record_decision(
+        self,
+        transaction_id: str | None,
+        risk_score: float,
+        decision: str,
+        *,
+        features: Mapping[str, float] | None = None,
+        step: int | None = None,
+        model_version: str | None = None,
+    ) -> None:
+        """Remember a served decision until its label arrives. Ids are required to join.
+
+        ``features``, ``step`` and ``model_version`` are kept only when a feedback log is
+        attached and all three are given; otherwise they are dropped immediately.
+        """
         if not transaction_id or not self.enabled:
             return
+        if self.feedback is not None and features is not None and step is not None:
+            entry = _Pending(risk_score, decision, dict(features), step, model_version or "")
+        else:
+            entry = _Pending(risk_score, decision)
         with self._lock:
             # A re-scored id keeps only its latest decision, which is the one that stands.
             self._pending.pop(transaction_id, None)
             self._labelled_ids.pop(transaction_id, None)
-            self._pending[transaction_id] = (risk_score, decision)
+            self._pending[transaction_id] = entry
             while len(self._pending) > self.pending_capacity:
                 self._pending.popitem(last=False)
                 self.evicted += 1
@@ -110,7 +152,7 @@ class OutcomeTracker:
                 )
                 self.label_status[status.value] += 1
                 return status
-            _, decision = entry
+            decision = entry.decision
             self._labelled_ids[transaction_id] = None
             while len(self._labelled_ids) > max(self.pending_capacity, 1):
                 self._labelled_ids.popitem(last=False)
@@ -119,7 +161,20 @@ class OutcomeTracker:
                 self._window.popleft()
             self._window.append((decision, is_fraud))
             self.label_status[LabelStatus.MATCHED.value] += 1
-            return LabelStatus.MATCHED
+        # Outside the tracker lock: file I/O must not serialise scoring threads.
+        if self.feedback is not None and entry.features is not None and entry.step is not None:
+            self.feedback.append(
+                FeedbackRecord(
+                    transaction_id=transaction_id,
+                    step=entry.step,
+                    model_version=entry.model_version or "",
+                    risk_score=entry.risk_score,
+                    decision=entry.decision,
+                    is_fraud=is_fraud,
+                    features=entry.features,
+                )
+            )
+        return LabelStatus.MATCHED
 
     @property
     def pending(self) -> int:
@@ -191,4 +246,6 @@ class OutcomeTracker:
             if defined:  # omitted while undefined (no calls / no frauds in the window)
                 lines += [f"# HELP {metric} {text}", f"# TYPE {metric} gauge"]
                 lines += [f'{metric}{{level="{lvl}"}} {v:.6f}' for lvl, v in defined]
+        if self.feedback is not None:
+            lines += self.feedback.render()
         return lines
