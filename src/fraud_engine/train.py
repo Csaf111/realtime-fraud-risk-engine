@@ -16,6 +16,10 @@ Examples:
     # Recommend thresholds for an alert budget: review <= 1% of traffic, block <= 0.2%
     python -m fraud_engine.train --data data/raw/paysim.csv --review-budget 0.01 \
         --block-budget 0.002
+
+    # Retrain a candidate from the engine's own labelled traffic (FRE_FEEDBACK_LOG_PATH),
+    # then deploy it as a shadow model with FRE_SHADOW_MODEL_PATH
+    python -m fraud_engine.train --feedback data/feedback.jsonl --out models/candidate.json
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, precision_score, recall_score, roc_auc_score
@@ -37,6 +42,7 @@ from .artifacts import ScoringModel
 from .drift import ScoreReference
 from .feature_drift import FeatureReference
 from .features import FEATURE_NAMES
+from .feedback import dedupe_feedback, read_feedback
 from .model import LogisticBaseline
 from .preprocessing import (
     LABEL,
@@ -95,6 +101,61 @@ def _check_export_parity(model: GradientBoostedTrees, clf: Any, X: np.ndarray) -
             raise RuntimeError(
                 f"Exported trees disagree with scikit-learn: {got!r} vs {float(want)!r}"
             )
+
+
+def _fit_model(
+    model_type: str,
+    train_features: Any,
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    X_te: np.ndarray,
+    version: str,
+    C: float = 1.0,
+    n_estimators: int = 100,
+    max_depth: int = 3,
+    learning_rate: float = 0.1,
+    random_state: int = 0,
+) -> tuple[ScoringModel, np.ndarray, dict[str, Any]]:
+    """Fit the chosen model on TRAINING rows only; return it, test probabilities and the
+    hyperparameters. Shared by PaySim training and feedback retraining so both produce
+    identical artifacts from identical inputs."""
+    feature_cols = list(FEATURE_NAMES)
+    model: ScoringModel
+    if model_type == "logreg":
+        mean, scale = fit_standardiser(train_features)
+        clf = LogisticRegression(C=C, class_weight="balanced", max_iter=2000)
+        clf.fit((X_tr - mean) / scale, y_tr)
+        p_te = clf.predict_proba((X_te - mean) / scale)[:, 1]
+        model = LogisticBaseline(
+            feature_names=feature_cols,
+            mean=mean.tolist(),
+            scale=scale.tolist(),
+            coef=clf.coef_[0].tolist(),
+            intercept=float(clf.intercept_[0]),
+            version=version,
+        )
+        return model, p_te, {"C": C}
+    gbt = GradientBoostingClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        random_state=random_state,
+    )
+    # Trees take raw features (no standardisation); balance classes like the baseline.
+    gbt.fit(X_tr, y_tr, sample_weight=compute_sample_weight("balanced", y_tr))
+    p_te = gbt.predict_proba(X_te)[:, 1]
+    model = GradientBoostedTrees.from_sklearn(gbt, feature_cols, X_tr, version=version)
+    _check_export_parity(model, gbt, X_te if len(X_te) else X_tr)
+    return (
+        model,
+        p_te,
+        {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "learning_rate": learning_rate,
+            "random_state": random_state,
+        },
+    )
 
 
 def reference_path_for(model_path: str | Path) -> Path:
@@ -219,39 +280,19 @@ def train(
     y_te = test_df[LABEL].to_numpy()
 
     version = version or datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    model: ScoringModel
-    if model_type == "logreg":
-        mean, scale = fit_standardiser(train_df[feature_cols])
-        clf = LogisticRegression(C=C, class_weight="balanced", max_iter=2000)
-        clf.fit((X_tr - mean) / scale, y_tr)
-        p_te = clf.predict_proba((X_te - mean) / scale)[:, 1]
-        model = LogisticBaseline(
-            feature_names=feature_cols,
-            mean=mean.tolist(),
-            scale=scale.tolist(),
-            coef=clf.coef_[0].tolist(),
-            intercept=float(clf.intercept_[0]),
-            version=version,
-        )
-        hyperparams: dict[str, Any] = {"C": C}
-    else:
-        gbt = GradientBoostingClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            random_state=random_state,
-        )
-        # Trees take raw features (no standardisation); balance classes like the baseline.
-        gbt.fit(X_tr, y_tr, sample_weight=compute_sample_weight("balanced", y_tr))
-        p_te = gbt.predict_proba(X_te)[:, 1]
-        model = GradientBoostedTrees.from_sklearn(gbt, feature_cols, X_tr, version=version)
-        _check_export_parity(model, gbt, X_te if len(X_te) else X_tr)
-        hyperparams = {
-            "n_estimators": n_estimators,
-            "max_depth": max_depth,
-            "learning_rate": learning_rate,
-            "random_state": random_state,
-        }
+    model, p_te, hyperparams = _fit_model(
+        model_type,
+        train_df[feature_cols],
+        X_tr,
+        y_tr,
+        X_te,
+        version,
+        C=C,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        random_state=random_state,
+    )
 
     metrics = {
         "model": _metrics(y_te, p_te, 0.5),
@@ -299,6 +340,111 @@ def train(
     return metrics
 
 
+SERVED_SCORE = "served_risk_score"
+
+
+def feedback_frame(feedback_path: str | Path) -> pd.DataFrame:
+    """Load a feedback log as a time-ordered, id-deduped frame.
+
+    Columns: ``FEATURE_NAMES`` (the exact served vectors), ``step`` (ordering only),
+    ``LABEL`` and ``served_risk_score`` (the live model's score, kept only as a baseline to
+    beat; it is never a feature). Transaction ids, decisions and model versions are dropped.
+    """
+    records = dedupe_feedback(read_feedback(feedback_path))
+    if not records:
+        raise ValueError(f"{feedback_path}: feedback log has no records")
+    rows = [
+        {
+            **{name: float(r.features[name]) for name in FEATURE_NAMES},
+            "step": r.step,
+            LABEL: int(r.is_fraud),
+            SERVED_SCORE: r.risk_score,
+        }
+        for r in records
+    ]
+    return pd.DataFrame(rows, columns=[*FEATURE_NAMES, "step", LABEL, SERVED_SCORE])
+
+
+def train_from_feedback(
+    feedback_path: str | Path,
+    out_path: str | Path,
+    test_frac: float = 0.2,
+    gap_steps: int = 24,
+    C: float = 1.0,
+    version: str | None = None,
+    validation_frac: float = 0.2,
+    model_type: str = "logreg",
+    n_estimators: int = 100,
+    max_depth: int = 3,
+    learning_rate: float = 0.1,
+    random_state: int = 0,
+) -> dict[str, Any]:
+    """Retrain a candidate model from the delayed-label feedback log.
+
+    Same temporal split, embargo gap and leakage checks as PaySim training, but on the
+    feature vectors the engine actually served, so online/offline parity holds by
+    construction. The test window reports the candidate next to the live model's served
+    scores. The result is meant to be deployed as a shadow model first
+    (``FRE_SHADOW_MODEL_PATH``), never promoted straight to live.
+
+    The feedback log has no raw transaction, so the rules score (and therefore the blended
+    score reference and alert-budget thresholds) cannot be rebuilt here; the per-feature
+    drift reference is written from the most recent slice of the training window.
+    """
+    if model_type not in MODEL_CHOICES:
+        raise ValueError(f"model_type must be one of {MODEL_CHOICES}")
+    if not 0.0 < validation_frac < 1.0:
+        raise ValueError("validation_frac must be between 0 and 1")
+    frame = feedback_frame(feedback_path)
+    train_df, test_df, split = temporal_split(frame, test_frac=test_frac, gap_steps=gap_steps)
+    feature_cols = list(FEATURE_NAMES)
+    report = leakage_checks(train_df, test_df, feature_cols, gap_steps)
+
+    X_tr = train_df[feature_cols].to_numpy(dtype=float)
+    X_te = test_df[feature_cols].to_numpy(dtype=float)
+    y_tr = train_df[LABEL].to_numpy()
+    y_te = test_df[LABEL].to_numpy()
+
+    version = version or datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    model, p_te, hyperparams = _fit_model(
+        model_type,
+        train_df[feature_cols],
+        X_tr,
+        y_tr,
+        X_te,
+        version,
+        C=C,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        random_state=random_state,
+    )
+    metrics: dict[str, Any] = {
+        "source": "feedback",
+        "model": _metrics(y_te, p_te, 0.5),
+        "served_baseline": _metrics(y_te, test_df[SERVED_SCORE].to_numpy(dtype=float), 0.5),
+        "split": split.__dict__,
+        "leakage_report": report,
+        "data": str(feedback_path),
+        "feedback_records": len(frame),
+        "model_type": model_type,
+        "hyperparams": hyperparams,
+        "score_reference": None,
+    }
+    feature_reference = _feature_reference(model, train_df, validation_frac)
+    feat_ref_path = feature_reference_path_for(out_path)
+    metrics["feature_reference"] = {
+        "path": str(feat_ref_path),
+        "rows": feature_reference.n,
+        "steps": feature_reference.steps,
+    }
+    model.metadata = {"trained_at": datetime.now(UTC).isoformat(), "metrics": metrics}
+    model.save(out_path)
+    feature_reference.save(feat_ref_path)
+    Path(out_path).with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2))
+    return metrics
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -306,6 +452,11 @@ def main(argv: list[str] | None = None) -> None:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--data", help="Path to the PaySim CSV")
     src.add_argument("--synthetic", type=int, metavar="N", help="Generate N synthetic rows instead")
+    src.add_argument(
+        "--feedback",
+        metavar="JSONL",
+        help="Retrain from a delayed-label feedback log (FRE_FEEDBACK_LOG_PATH) instead",
+    )
     ap.add_argument("--out", default="models/baseline.json")
     ap.add_argument("--nrows", type=int, default=None)
     ap.add_argument("--test-frac", type=float, default=0.2)
@@ -348,6 +499,28 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(argv)
     if (a.review_budget is None) != (a.block_budget is None):
         ap.error("--review-budget and --block-budget must be given together")
+    if a.feedback:
+        if a.review_budget is not None or a.rules_floor:
+            ap.error("--feedback has no raw transactions: budgets and --rules-floor need them")
+        fm = train_from_feedback(
+            a.feedback,
+            a.out,
+            a.test_frac,
+            a.gap_steps,
+            a.C,
+            a.version,
+            validation_frac=a.validation_frac,
+            model_type=a.model,
+            n_estimators=a.n_estimators,
+            max_depth=a.max_depth,
+            learning_rate=a.learning_rate,
+        )
+        fsum = {"model": fm["model"], "served_baseline": fm["served_baseline"]}
+        print(json.dumps(fsum, indent=2))
+        print(f"Saved candidate model to {a.out}")
+        print(f"Saved feature drift reference to {fm['feature_reference']['path']}")
+        print(f"Deploy as a shadow model first: FRE_SHADOW_MODEL_PATH={a.out}")
+        return
 
     if a.synthetic:
         tmp = Path(tempfile.mkdtemp()) / "synthetic.csv"

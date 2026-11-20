@@ -132,5 +132,5 @@ flowchart LR
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once), with consumer-group rebalance hooks and textfile metrics | Per-partition watermarks; consumer lag in the metrics file |
-| Feedback | `POST /v1/labels` joins labels to served decisions; optional JSONL feedback log of served features + labels | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
+| Feedback | `POST /v1/labels` joins labels to served decisions; optional JSONL feedback log of served features + labels; `train --feedback` retrains a candidate for shadow deployment | Automated retrain + shadow-gated promotion |
 | Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |

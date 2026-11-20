@@ -224,6 +224,25 @@ are best-effort: failures increment `fre_feedback_write_errors_total` and never 
 features are retained in memory. With several replicas, give each its own file and
 concatenate (`feedback_dataset` dedupes by id).
 
+#### Retraining from the feedback log
+
+```bash
+# Concatenate replica logs, retrain a candidate on the served vectors, write a feature reference
+python -m fraud_engine.train --feedback data/feedback.jsonl --out models/candidate.json --model gbt
+# Deploy it next to the live model; compare via fre_shadow_* before any promotion
+FRE_SHADOW_MODEL_PATH=models/candidate.json uvicorn fraud_engine.api:app
+```
+
+`--feedback` reuses the PaySim pipeline's temporal split, embargo gap (`--gap-steps`) and
+`leakage_checks`, so the candidate is evaluated on later, unseen labelled traffic. Its
+metrics report the candidate (`model`) next to the live engine's own logged scores on the
+same test window (`served_baseline`): the bar a candidate must clear. The logged score is a
+baseline only and never a feature. The log holds no raw transactions, so rules cannot be
+re-run: `--review-budget`/`--block-budget` and `--rules-floor` are rejected and no blended
+score reference is written (the per-feature drift reference is). Labelled traffic is a
+selected sample (mostly what was reviewed or charged back), so treat the test metrics as
+optimistic and let shadow agreement decide promotion.
+
 ### Request
 
 Field names match the PaySim columns, so a dataset row can be posted as-is once you remove
@@ -467,6 +486,7 @@ make lint typecheck
 | `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
 | `test_outcomes.py` | Delayed-label join: matched/unknown/duplicate, bounded buffers, rolling precision/recall, `/v1/labels`, labels never change later scores |
 | `test_feedback.py` | Feedback log: record round-trip and contract validation, time-ordered deduped dataset without metadata, best-effort writes, logged vector equals the online features end to end |
+| `test_train_feedback.py` | Feedback retraining: deduped time-ordered frame without ids, temporal split + embargo + leakage checks, served score as baseline only, candidate loads as a shadow model, CLI guards |
 | `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
@@ -569,9 +589,9 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Feature-level drift: PSI per input feature (`FRE_FEATURE_REFERENCE_PATH`, `fre_feature_psi{feature}`)
 - [x] Label-delayed performance monitoring (`POST /v1/labels`, `fre_label_precision` / `fre_label_recall`)
 - [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
-- [ ] Delayed-label feedback loop
+- [x] Delayed-label feedback loop
   - [x] Capture: served features joined to delayed labels in a JSONL log (`FRE_FEEDBACK_LOG_PATH`, `read_feedback` / `feedback_dataset`)
-  - [ ] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model
+  - [x] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model (`FRE_SHADOW_MODEL_PATH`)
 
 ## Acknowledgements
 

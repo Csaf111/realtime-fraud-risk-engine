@@ -155,6 +155,17 @@ def read_feedback(path: str | Path) -> Iterator[FeedbackRecord]:
                 raise ValueError(f"{path}:{lineno}: {exc}") from exc
 
 
+def dedupe_feedback(
+    records: list[FeedbackRecord] | Iterator[FeedbackRecord],
+) -> list[FeedbackRecord]:
+    """Records in time order (by ``step``), one per transaction id; the last one wins."""
+    latest: dict[str, FeedbackRecord] = {}
+    for rec in records:
+        latest.pop(rec.transaction_id, None)
+        latest[rec.transaction_id] = rec
+    return sorted(latest.values(), key=lambda r: r.step)  # stable: ties keep log order
+
+
 def feedback_dataset(
     records: list[FeedbackRecord] | Iterator[FeedbackRecord],
 ) -> tuple[list[list[float]], list[int], list[int]]:
@@ -164,11 +175,7 @@ def feedback_dataset(
     only so callers can make a temporal split. If an id appears more than once (a log
     concatenated from several replicas or restarts), the last record wins.
     """
-    latest: dict[str, FeedbackRecord] = {}
-    for rec in records:
-        latest.pop(rec.transaction_id, None)
-        latest[rec.transaction_id] = rec
-    ordered = sorted(latest.values(), key=lambda r: r.step)  # stable: ties keep log order
+    ordered = dedupe_feedback(records)
     X = [[float(r.features[name]) for name in FEATURE_NAMES] for r in ordered]
     y = [int(r.is_fraud) for r in ordered]
     steps = [r.step for r in ordered]
