@@ -243,6 +243,24 @@ score reference is written (the per-feature drift reference is). Labelled traffi
 selected sample (mostly what was reviewed or charged back), so treat the test metrics as
 optimistic and let shadow agreement decide promotion.
 
+#### Promotion gate
+
+Shadow metrics show how often a candidate disagrees with live, not which one is right. Once
+more labels have arrived, replay the feedback log through both artifacts and gate on it:
+
+```bash
+python -m fraud_engine.promote --live models/baseline.json --candidate models/candidate.json \
+    --feedback data/feedback.jsonl --max-pr-auc-drop 0 --max-recall-drop 0 \
+    --report reports/promotion.json   # exit 0 = PASS, 1 = FAIL or too little evidence
+```
+
+Both models score the served feature vectors (no labels, ids, `step` or logged scores), and
+the report gives live vs candidate PR-AUC/ROC-AUC/precision/recall, the deltas, decision
+agreement and fraud newly caught/missed. The evaluation window starts after the training
+window + embargo of any model trained with `--feedback` (read from its metadata); an
+`--after-step` inside it is a `LeakageError`. A window with fewer than `--min-positives`
+labelled frauds (or no legitimate rows) is refused, never passed.
+
 ### Request
 
 Field names match the PaySim columns, so a dataset row can be posted as-is once you remove
@@ -487,6 +505,7 @@ make lint typecheck
 | `test_outcomes.py` | Delayed-label join: matched/unknown/duplicate, bounded buffers, rolling precision/recall, `/v1/labels`, labels never change later scores |
 | `test_feedback.py` | Feedback log: record round-trip and contract validation, time-ordered deduped dataset without metadata, best-effort writes, logged vector equals the online features end to end |
 | `test_train_feedback.py` | Feedback retraining: deduped time-ordered frame without ids, temporal split + embargo + leakage checks, served score as baseline only, candidate loads as a shadow model, CLI guards |
+| `test_promote.py` | Promotion gate: default window equals the candidate's unseen test window, overlap with training data is a `LeakageError`, better candidate passes / worse fails with reasons, tolerances, labels never change scores, thin evidence refused, CLI exit codes + report |
 | `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
@@ -561,6 +580,7 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── artifacts.py       Model artifact loader (dispatch on model_type)
 │   ├── preprocessing.py   Leakage-safe PaySim pipeline + checks
 │   ├── train.py           Training CLI
+│   ├── promote.py         Offline promotion gate: candidate vs live on labelled feedback
 │   ├── synthetic.py       PaySim-shaped generator for CI
 │   ├── schemas.py         Pydantic request/response models
 │   ├── metrics.py         Prometheus-format metrics
@@ -592,6 +612,7 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Delayed-label feedback loop
   - [x] Capture: served features joined to delayed labels in a JSONL log (`FRE_FEEDBACK_LOG_PATH`, `read_feedback` / `feedback_dataset`)
   - [x] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model (`FRE_SHADOW_MODEL_PATH`)
+  - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
 
 ## Acknowledgements
 
