@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 fraud-engine-train = "fraud_engine.train:main"
+fraud-engine-promote = "fraud_engine.promote:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
