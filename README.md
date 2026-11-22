@@ -81,6 +81,10 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 
 Every response carries an `x-request-id` header. The API echoes yours or generates one.
 
+Request bodies are capped at `FRE_MAX_BODY_BYTES` (2 MiB by default) **before** any JSON is
+parsed, so an oversized payload is refused with `413` without being buffered or decoded,
+including chunked uploads without a `Content-Length`.
+
 ### Monitoring metrics
 
 `/metrics` exports, alongside request/decision counts and scoring latency:
@@ -550,6 +554,7 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_VELOCITY_WINDOW_STEPS` | `24` | Velocity look-back (PaySim steps = hours) |
 | `FRE_HIGH_AMOUNT_THRESHOLD` | `200000` | R003 threshold |
 | `FRE_MAX_BATCH_SIZE` | `1000` | Batch endpoint limit |
+| `FRE_MAX_BODY_BYTES` | `2097152` | Max request body (bytes), enforced before JSON parsing: oversized `Content-Length` or streamed bodies get `413`, malformed `Content-Length` gets `400`. Must fit a full batch (~300 B per transaction) |
 | `FRE_ENVIRONMENT` | `local` | Reported by `/ready` |
 | `FRE_VELOCITY_BACKEND` | `memory` | `memory` (per process) or `redis` (shared across replicas; needs the `redis` extra) |
 | `FRE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL for the `redis` backend |
@@ -613,6 +618,7 @@ are in [docs/cicd.md](docs/cicd.md).
   - [x] Capture: served features joined to delayed labels in a JSONL log (`FRE_FEEDBACK_LOG_PATH`, `read_feedback` / `feedback_dataset`)
   - [x] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model (`FRE_SHADOW_MODEL_PATH`)
   - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
+- [x] Request body size limit enforced before JSON parsing (`FRE_MAX_BODY_BYTES`, `413` / `400`)
 
 ## Acknowledgements
 
