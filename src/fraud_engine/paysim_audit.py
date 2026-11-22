@@ -23,7 +23,8 @@ def audit(path: str | Path) -> dict:
     count = fraud = flagged = 0
     previous_step = -1
     by_type: Counter[str] = Counter()
-    by_step: Counter[int] = Counter()
+    distinct_steps = 0
+    first_step: int | None = None
     with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, restkey="__extra__", restval=None)
         headers = reader.fieldnames
@@ -40,6 +41,10 @@ def audit(path: str | Path) -> dict:
             step = int(raw_step)
             if step < previous_step:
                 raise ValueError(f"line {line}: nonchronological step")
+            if step != previous_step:
+                distinct_steps += 1
+                if first_step is None:
+                    first_step = step
             previous_step = step
             if row["type"] not in TYPES:
                 raise ValueError(f"line {line}: unknown transaction type")
@@ -59,13 +64,12 @@ def audit(path: str | Path) -> dict:
             fraud += int(row["isFraud"])
             flagged += int(row["isFlaggedFraud"])
             by_type[row["type"]] += 1
-            by_step[step] += 1
     if count == 0:
         raise ValueError("empty dataset")
     return {
         "rows": count, "fraud_rows": fraud, "fraud_prevalence": fraud / count,
-        "flagged_rows": flagged, "min_step": min(by_step), "max_step": max(by_step),
-        "distinct_steps": len(by_step), "transactions_by_type": dict(sorted(by_type.items())),
+        "flagged_rows": flagged, "min_step": first_step, "max_step": previous_step,
+        "distinct_steps": distinct_steps, "transactions_by_type": dict(sorted(by_type.items())),
         "schema": "PaySim-v1", "status": "passed",
     }
 
