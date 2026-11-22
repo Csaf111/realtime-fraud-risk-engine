@@ -63,3 +63,21 @@ def test_rejects_extra_csv_fields(tmp_path):
         handle.write(",".join(["0"] * (len(REQUIRED) + 1)) + "\n")
     with pytest.raises(ValueError, match="malformed"):
         audit(path)
+
+
+def test_distinct_steps_counts_runs_not_rows(tmp_path):
+    report = audit(write_rows(tmp_path, [
+        row(step="0", isFraud="0"), row(step="0"),
+        row(step="4", isFraud="0"), row(step="4", isFraud="0"),
+        row(step="100", isFraud="0"),
+    ]))
+    assert report["rows"] == 5
+    assert report["min_step"] == 0
+    assert report["max_step"] == 100
+    assert report["distinct_steps"] == 3
+
+
+def test_single_step_report(tmp_path):
+    report = audit(write_rows(tmp_path, [row(step="7"), row(step="7")]))
+    assert report["min_step"] == report["max_step"] == 7
+    assert report["distinct_steps"] == 1
