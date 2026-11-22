@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .limits import DEFAULT_MAX_BODY_BYTES, MIN_MAX_BODY_BYTES
+
 
 def _float(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -36,6 +38,9 @@ class Settings:
             steps (1 step = 1 simulated hour).
         high_amount_threshold: amount above which rule R003 fires.
         max_batch_size: maximum transactions accepted by the batch endpoint.
+        max_body_bytes: maximum HTTP request body size in bytes, enforced before any JSON
+            is parsed (``413`` above it). Must fit a full batch of ``max_batch_size``
+            transactions (about 300 bytes each as JSON).
         velocity_backend: ``memory`` (per-process, default) or ``redis`` (shared across
             replicas; requires the ``redis`` extra).
         redis_url: connection URL used when ``velocity_backend == "redis"``.
@@ -68,6 +73,7 @@ class Settings:
     velocity_window_steps: int = 24
     high_amount_threshold: float = 200_000.0
     max_batch_size: int = 1000
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     environment: str = field(default="local")
     velocity_backend: str = "memory"
     redis_url: str = "redis://localhost:6379/0"
@@ -90,6 +96,10 @@ class Settings:
             raise ValueError("rules_floor must be between 0 and 1")
         if self.velocity_window_steps < 1:
             raise ValueError("velocity_window_steps must be >= 1")
+        if self.max_batch_size < 1:
+            raise ValueError("max_batch_size must be >= 1")
+        if self.max_body_bytes < MIN_MAX_BODY_BYTES:
+            raise ValueError(f"max_body_bytes must be >= {MIN_MAX_BODY_BYTES}")
         if self.velocity_backend not in VELOCITY_BACKENDS:
             raise ValueError(f"velocity_backend must be one of {sorted(VELOCITY_BACKENDS)}")
         if not self.redis_key_prefix:
@@ -116,6 +126,7 @@ class Settings:
             velocity_window_steps=_int("FRE_VELOCITY_WINDOW_STEPS", 24),
             high_amount_threshold=_float("FRE_HIGH_AMOUNT_THRESHOLD", 200_000.0),
             max_batch_size=_int("FRE_MAX_BATCH_SIZE", 1000),
+            max_body_bytes=_int("FRE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
             environment=os.getenv("FRE_ENVIRONMENT", "local"),
             velocity_backend=(os.getenv("FRE_VELOCITY_BACKEND") or "memory").strip().lower(),
             redis_url=os.getenv("FRE_REDIS_URL") or "redis://localhost:6379/0",

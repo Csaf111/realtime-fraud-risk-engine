@@ -27,7 +27,7 @@ flowchart LR
 
 | Threat | Current posture | Required production control |
 |---|---|---|
-| Unauthenticated high-volume scoring or scraping | No built-in authentication or rate limiting | Gateway authentication, quotas, request-size limits and abuse monitoring |
+| Unauthenticated high-volume scoring or scraping | No built-in authentication or rate limiting; request bodies capped at `FRE_MAX_BODY_BYTES` before JSON parsing (`413`), batches at `FRE_MAX_BATCH_SIZE` | Gateway authentication, quotas, edge request-size limits and abuse monitoring |
 | Transaction replay or duplicate events corrupt velocity counts | No durable idempotency contract | Authenticated idempotency key, bounded retention, deduplication and replay tests |
 | Concurrent requests race on velocity state | In-memory state is process-local; Redis proposal still has snapshot/record race | Partition by account or implement atomic snapshot-and-record with ordered event handling |
 | Post-authorisation information contaminates a decision | v1 rules/features reference post-transaction balances | Versioned pre-authorisation request contract, new feature schema and retraining; do not use v1 for payment authorisation |
