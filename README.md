@@ -98,6 +98,8 @@ including chunked uploads without a `Content-Length`.
 | `fre_score_drift_window_count` | gauge | Live scores currently in the drift window |
 | `fre_feature_psi{feature}` | gauge | PSI of each model input over the last `FRE_DRIFT_WINDOW` transactions vs the training feature reference (only with `FRE_FEATURE_REFERENCE_PATH`, once warm) |
 | `fre_feature_drift_window_count` | gauge | Feature vectors currently in the feature drift window |
+| `fre_velocity_keys` | gauge | Account keys held by the in-memory velocity store (bounded by accounts active in the last `FRE_VELOCITY_WINDOW_STEPS`) |
+| `fre_velocity_evicted_keys_total` | counter | Idle velocity keys evicted once all their events left the window (in-memory backend only) |
 | `fre_feature_drift_skipped_total` | counter | Feature vectors skipped because a value was non-finite |
 | `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
 | `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
@@ -619,6 +621,7 @@ are in [docs/cicd.md](docs/cicd.md).
   - [x] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model (`FRE_SHADOW_MODEL_PATH`)
   - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
 - [x] Request body size limit enforced before JSON parsing (`FRE_MAX_BODY_BYTES`, `413` / `400`)
+- [x] Bounded in-memory velocity state: idle account keys evicted once outside the window, snapshot-exact (`fre_velocity_keys`, `fre_velocity_evicted_keys_total`)
 
 ## Acknowledgements
 
