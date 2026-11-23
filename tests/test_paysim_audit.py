@@ -81,3 +81,27 @@ def test_single_step_report(tmp_path):
     report = audit(write_rows(tmp_path, [row(step="7"), row(step="7")]))
     assert report["min_step"] == report["max_step"] == 7
     assert report["distinct_steps"] == 1
+
+
+def test_flagged_vs_actual_fraud_confusion_counts(tmp_path):
+    report = audit(write_rows(tmp_path, [
+        row(step="1", type="TRANSFER", isFraud="1", isFlaggedFraud="1"),
+        row(step="1", type="TRANSFER", isFraud="0", isFlaggedFraud="1"),
+        row(step="2", type="CASH_OUT", isFraud="1", isFlaggedFraud="0"),
+        row(step="3", type="PAYMENT", isFraud="0", isFlaggedFraud="0"),
+    ]))
+    assert report["flagged_true_fraud"] == 1
+    assert report["flagged_false_positive"] == 1
+    assert report["unflagged_fraud"] == 1
+    assert report["fraud_by_type"]["TRANSFER"] == 1
+    assert report["fraud_by_type"]["CASH_OUT"] == 1
+    assert report["flagged_by_type"]["TRANSFER"] == 2
+    assert report["fraud_by_type"]["PAYMENT"] == 0
+    assert sum(report["fraud_by_type"].values()) == report["fraud_rows"]
+    assert sum(report["flagged_by_type"].values()) == report["flagged_rows"]
+
+
+def test_no_fraud_or_flags_has_zero_confusion_counts(tmp_path):
+    report = audit(write_rows(tmp_path, [row(isFraud="0", isFlaggedFraud="0")]))
+    assert (report["flagged_true_fraud"], report["flagged_false_positive"],
+            report["unflagged_fraud"]) == (0, 0, 0)
