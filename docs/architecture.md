@@ -134,7 +134,7 @@ flowchart LR
 
 | Concern | Today (starter) | Next step |
 |---|---|---|
-| Velocity state | In-process deques by default; `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
+| Velocity state | In-process deques by default (idle account keys evicted once every event has left the window, so memory tracks active accounts, not all accounts ever seen; parity-tested against a non-evicting store); `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once), with consumer-group rebalance hooks and textfile metrics | Per-partition watermarks; consumer lag in the metrics file |
