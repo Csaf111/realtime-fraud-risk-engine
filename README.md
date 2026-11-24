@@ -362,9 +362,14 @@ FRE_VELOCITY_BACKEND=redis FRE_REDIS_URL=redis://localhost:6379/0 make run
 
 `RedisVelocityStore` implements the same `VelocityBackend` interface and window semantics
 as the in-memory store; a parity test replays a random step-ordered stream through both
-and requires identical snapshots. `snapshot` and `record` are separate round trips, so
-two replicas scoring the *same account* concurrently can miss each other's in-flight
-event; partition traffic by account if you need a strict order.
+and requires identical snapshots. Serving reads and writes velocity in one atomic
+`snapshot_and_record` step: a single lock in memory, an optimistic `WATCH`/`MULTI`
+transaction in Redis (retried on conflict, `VelocityContentionError` after
+`max_atomic_retries`). A burst of concurrent transactions on the *same account*, even
+across replicas, is therefore serialised: the k-th event sees the k-1 before it instead of
+all of them reading the same stale count and slipping under the velocity rules. Events in
+the same step still have no defined order between them; partition traffic by account if
+you need a strict order.
 
 ## Training on PaySim
 
@@ -622,6 +627,7 @@ are in [docs/cicd.md](docs/cicd.md).
   - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
 - [x] Request body size limit enforced before JSON parsing (`FRE_MAX_BODY_BYTES`, `413` / `400`)
 - [x] Bounded in-memory velocity state: idle account keys evicted once outside the window, snapshot-exact (`fre_velocity_keys`, `fre_velocity_evicted_keys_total`)
+- [x] Atomic velocity read-then-write (`snapshot_and_record`): concurrent bursts on one account can't share a stale snapshot (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries)
 
 ## Acknowledgements
 

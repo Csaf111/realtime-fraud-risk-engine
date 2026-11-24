@@ -26,7 +26,7 @@ that blocks it. Each control is enforced in code and covered by a test.
 | L3 | Random row split | Neighbouring rows from the same hour or the same mule end up in both train and test, so the model learns the period instead of the pattern | `temporal_split()` by `step` | `test_temporal_split_has_gap` |
 | L4 | No gap between train and test | Labels arrive late in reality (chargebacks take days), and late-train behaviour bleeds into early-test | `gap_steps` (default 24h) dropped between partitions | `test_temporal_split_has_gap`, `leakage_checks` overlap rule |
 | L5 | Velocity features using future rows | Rolling or group stats computed over the whole frame look ahead | Stream replay: `snapshot()` before `record()` | `test_future_rows_do_not_change_past_features`, `test_snapshot_excludes_current_event` |
-| L6 | Self-inclusion in aggregates | A transaction counts itself in its own velocity | `record()` happens after scoring/feature building | `test_snapshot_excludes_current_event` |
+| L6 | Self-inclusion in aggregates | A transaction counts itself in its own velocity | The snapshot is read before the event is recorded (`snapshot_and_record`) | `test_snapshot_excludes_current_event` |
 | L7 | Label-aware features (target encoding, "past fraud count for this mule") | Uses labels that wouldn't be known yet | No feature reads `isFraud`. Building features with every label flipped gives identical output | `test_features_do_not_depend_on_labels` |
 | L8 | Scaler fitted on all data | Test distribution leaks into train | `fit_standardiser(train)` only | `test_standardiser_uses_train_only` |
 | L9 | Raw IDs as features | `nameOrig`/`nameDest` memorise specific accounts and don't generalise | IDs are only velocity keys, never values. `leakage_checks` rejects them | `test_leakage_checks_reject_forbidden_features` |
@@ -59,8 +59,11 @@ that blocks it. Each control is enforced in code and covered by a test.
   replicas, set `FRE_VELOCITY_BACKEND=redis`: `RedisVelocityStore` applies the same
   `(step - window, step]` filter and is parity-tested against the in-memory store, so
   offline (training replay, always in-memory) and online features stay identical.
-  Concurrent requests for the same account are still unordered between `snapshot` and
-  `record`; partition by account if strict ordering matters.
+  Serving and offline replay both call `snapshot_and_record`, which reads the window and
+  records the event atomically (lock in memory, `WATCH`/`MULTI` in Redis), so concurrent
+  requests for the same account are serialised and each sees every event committed before
+  it. Requests in the same step have no defined order between them; partition by account
+  if strict ordering matters.
 
 ## Pipeline order (what `fraud_engine.train` does)
 
