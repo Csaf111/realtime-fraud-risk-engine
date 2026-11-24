@@ -27,6 +27,12 @@ input, so a score shift can be traced to the input that moved. Its labels are th
 
 When an :class:`~fraud_engine.outcomes.OutcomeTracker` is attached, ``fre_label_*`` series
 report how served decisions fared once their delayed fraud labels arrived.
+
+When the in-memory :class:`~fraud_engine.state.VelocityStore` is attached,
+``fre_velocity_keys`` (live account keys) and ``fre_velocity_evicted_keys_total`` (idle keys
+dropped once their events left the window) show that velocity state stays bounded. The
+Redis backend is not polled here: counting its keys needs a ``SCAN``, which is too expensive
+to run on every scrape (its keys expire through ``ttl_seconds`` instead).
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from collections.abc import Iterable
 from .drift import SCORE_BUCKETS, DriftMonitor
 from .feature_drift import FeatureDriftMonitor
 from .outcomes import OutcomeTracker
+from .state import VelocityStore
 
 __all__ = ["SCORE_BUCKETS", "Metrics"]
 
@@ -50,8 +57,10 @@ class Metrics:
         drift: DriftMonitor | None = None,
         feature_drift: FeatureDriftMonitor | None = None,
         outcomes: OutcomeTracker | None = None,
+        velocity: VelocityStore | None = None,
     ) -> None:
         self.drift = drift
+        self.velocity = velocity
         self.outcomes = outcomes
         self.feature_drift = feature_drift
         self._lock = threading.Lock()
@@ -184,7 +193,22 @@ class Metrics:
                 lines += self._render_shadow()
             if self.outcomes is not None and self.outcomes.enabled:
                 lines += self.outcomes.render()
+        if self.velocity is not None:
+            # Read outside the metrics lock: the store has its own lock.
+            lines += self._render_velocity(self.velocity)
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _render_velocity(store: VelocityStore) -> list[str]:
+        return [
+            "# HELP fre_velocity_keys Account keys held by the in-memory velocity store.",
+            "# TYPE fre_velocity_keys gauge",
+            f"fre_velocity_keys {len(store)}",
+            "# HELP fre_velocity_evicted_keys_total Idle velocity keys evicted after leaving "
+            "the window.",
+            "# TYPE fre_velocity_evicted_keys_total counter",
+            f"fre_velocity_evicted_keys_total {store.evicted_keys}",
+        ]
 
     def _render_shadow(self) -> list[str]:
         lines = [

@@ -26,7 +26,7 @@ that blocks it. Each control is enforced in code and covered by a test.
 | L3 | Random row split | Neighbouring rows from the same hour or the same mule end up in both train and test, so the model learns the period instead of the pattern | `temporal_split()` by `step` | `test_temporal_split_has_gap` |
 | L4 | No gap between train and test | Labels arrive late in reality (chargebacks take days), and late-train behaviour bleeds into early-test | `gap_steps` (default 24h) dropped between partitions | `test_temporal_split_has_gap`, `leakage_checks` overlap rule |
 | L5 | Velocity features using future rows | Rolling or group stats computed over the whole frame look ahead | Stream replay: `snapshot()` before `record()` | `test_future_rows_do_not_change_past_features`, `test_snapshot_excludes_current_event` |
-| L6 | Self-inclusion in aggregates | A transaction counts itself in its own velocity | `record()` happens after scoring/feature building | `test_snapshot_excludes_current_event` |
+| L6 | Self-inclusion in aggregates | A transaction counts itself in its own velocity | The snapshot is read before the event is recorded (`snapshot_and_record`) | `test_snapshot_excludes_current_event` |
 | L7 | Label-aware features (target encoding, "past fraud count for this mule") | Uses labels that wouldn't be known yet | No feature reads `isFraud`. Building features with every label flipped gives identical output | `test_features_do_not_depend_on_labels` |
 | L8 | Scaler fitted on all data | Test distribution leaks into train | `fit_standardiser(train)` only | `test_standardiser_uses_train_only` |
 | L9 | Raw IDs as features | `nameOrig`/`nameDest` memorise specific accounts and don't generalise | IDs are only velocity keys, never values. `leakage_checks` rejects them | `test_leakage_checks_reject_forbidden_features` |
@@ -37,6 +37,8 @@ that blocks it. Each control is enforced in code and covered by a test.
 | L14 | Feature drift reference that reads labels, IDs or the test window, or bins features differently online | A skewed baseline masks or fakes input drift; binning drift between train and serve breaks parity | `FeatureReference` is built only from the served `FEATURE_NAMES` columns on the train-window tail; its feature set must equal `FEATURE_NAMES` exactly and the same `value_bin` code bins online values | `test_feature_reference_is_label_independent`, `test_train_writes_feature_reference_from_training_window_only`, `test_reference_rejects_feature_mismatch_and_empty` |
 | L15 | Delayed labels fed back into serving | Once labels flow into the running service, it is tempting to use them ("this account had fraud before"), which leaks future outcomes into scores and breaks offline/online parity | `POST /v1/labels` writes only to `OutcomeTracker` (score, decision, label counts). Features, rules, model and `VelocityStore` never see it; labels join only to decisions this replica actually served | `test_labels_do_not_change_later_scores`, `test_what_if_batch_scores_are_not_tracked` |
 | L16 | Feedback-log retraining set rebuilt or mis-aligned | Re-deriving features for labelled traffic later uses state that didn't exist at decision time; a log from a different feature set silently re-ordered into the model's inputs breaks parity; using the old score/decision/ids as inputs teaches the model to copy itself | `FRE_FEEDBACK_LOG_PATH` records the served, point-in-time feature dict captured before the label; `read_feedback` rejects any line whose features differ from `FEATURE_NAMES`; `feedback_dataset` emits only `FEATURE_NAMES` columns in `X` (ids, `step`, score, decision stay metadata) | `test_api_feedback_loop_matches_served_features`, `test_from_json_rejects_contract_violations`, `test_dataset_is_time_ordered_deduped_and_excludes_metadata` |
+| L17 | Retraining on feedback without a time split, or on the live score | A random split lets the candidate train on labels from after its test window; using the logged `risk_score` as an input teaches the candidate to copy the live model | `train --feedback` reuses `temporal_split` (embargo gap) and `leakage_checks`; the logged score is kept only as the `served_baseline` metric; the artifact's `feature_names` equal `FEATURE_NAMES` | `test_retrain_from_feedback_end_to_end`, `test_single_class_feedback_fails_leakage_checks`, `test_feedback_frame_is_deduped_time_ordered_and_drops_ids` |
+| L18 | Promotion decided on data a model was trained on | Grading a feedback-retrained candidate on rows inside its training window (or embargo) flatters it and promotes overfit models; letting labels or the logged score reach either model turns the comparison into a label leak | `fraud_engine.promote` scores only the served `FEATURE_NAMES` vectors; its window starts after the later of both models' `cutoff_step + gap_steps` (from artifact metadata) and an earlier `--after-step` raises `LeakageError`; too few labelled frauds is refused, not passed | `test_window_overlapping_training_data_is_a_leakage_error`, `test_labels_never_change_scores`, `test_thin_evidence_is_refused_not_passed` |
 
 ## Known risks that remain (be honest about them)
 
@@ -57,8 +59,11 @@ that blocks it. Each control is enforced in code and covered by a test.
   replicas, set `FRE_VELOCITY_BACKEND=redis`: `RedisVelocityStore` applies the same
   `(step - window, step]` filter and is parity-tested against the in-memory store, so
   offline (training replay, always in-memory) and online features stay identical.
-  Concurrent requests for the same account are still unordered between `snapshot` and
-  `record`; partition by account if strict ordering matters.
+  Serving and offline replay both call `snapshot_and_record`, which reads the window and
+  records the event atomically (lock in memory, `WATCH`/`MULTI` in Redis), so concurrent
+  requests for the same account are serialised and each sees every event committed before
+  it. Requests in the same step have no defined order between them; partition by account
+  if strict ordering matters.
 
 ## Pipeline order (what `fraud_engine.train` does)
 

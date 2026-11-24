@@ -17,6 +17,7 @@ from .config import Settings
 from .drift import DriftMonitor, ScoreReference
 from .feature_drift import FeatureDriftMonitor, FeatureReference
 from .feedback import FeedbackLog
+from .limits import BodySizeLimitMiddleware
 from .metrics import Metrics
 from .outcomes import LabelStatus, OutcomeTracker
 from .schemas import (
@@ -28,6 +29,7 @@ from .schemas import (
     Transaction,
 )
 from .scoring import RiskEngine, ScoredTransaction
+from .state import VelocityStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("fraud_engine.api")
@@ -83,6 +85,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         app.state.engine = engine or RiskEngine(settings)
         if feature_drift is not None:
             app.state.engine.feature_observer = feature_drift.observe
+        store = app.state.engine.store
         app.state.metrics = Metrics(
             drift=_drift_monitor(settings),
             feature_drift=feature_drift,
@@ -93,6 +96,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
                     FeedbackLog(settings.feedback_log_path) if settings.feedback_log_path else None
                 ),
             ),
+            velocity=store if isinstance(store, VelocityStore) else None,
         )
         log.info(
             "Engine ready: mode=%s version=%s env=%s",
@@ -108,6 +112,10 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         description="Explainable real-time fraud risk scoring for PaySim-style transactions.",
         lifespan=lifespan,
     )
+
+    # Added before the request-id middleware so it sits *inside* it: 413/400 responses
+    # from the size limit still carry an x-request-id.
+    app.add_middleware(BodySizeLimitMiddleware, max_body_bytes=settings.max_body_bytes)
 
     @app.middleware("http")
     async def request_id(request: Request, call_next):

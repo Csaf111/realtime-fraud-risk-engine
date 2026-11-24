@@ -25,7 +25,7 @@ from .config import Settings
 from .features import compute_features
 from .rules import DEFAULT_RULES, Rule, RuleContext, evaluate_rules
 from .schemas import Decision, FeatureContribution, RiskResult, RuleHit, Transaction
-from .state import VelocityBackend, build_velocity_store
+from .state import VelocityBackend, build_velocity_store, snapshot_and_record
 from .thresholds import blend_risk, rules_floor_binds
 
 log = logging.getLogger(__name__)
@@ -134,8 +134,17 @@ class RiskEngine:
         start = time.perf_counter()
         data: Mapping[str, Any] = txn.model_dump() if isinstance(txn, Transaction) else txn
 
-        # 1. Point-in-time state BEFORE this event (no self-leakage).
-        velocity = self.store.snapshot(data["nameOrig"], data["nameDest"], int(data["step"]))
+        # 1. Point-in-time state BEFORE this event (no self-leakage). When the event is to be
+        # recorded, snapshot and record happen atomically so concurrent requests for the same
+        # account can't all read the same stale velocity (see fraud_engine.state). The event
+        # is recorded even if a later step raises: the attempt still happened.
+        name_orig, name_dest, step = data["nameOrig"], data["nameDest"], int(data["step"])
+        if update_state:
+            velocity = snapshot_and_record(
+                self.store, name_orig, name_dest, step, float(data["amount"])
+            )
+        else:
+            velocity = self.store.snapshot(name_orig, name_dest, step)
         features = compute_features(data, velocity)
         if self.feature_observer is not None:
             self._observe_features(features)
@@ -165,12 +174,6 @@ class RiskEngine:
                 f"FLOOR: rules score held risk at >= {self.settings.rules_floor:g} x rules score"
             )
 
-        # 4. Record AFTER scoring so future events see this one.
-        if update_state:
-            self.store.record(
-                data["nameOrig"], data["nameDest"], int(data["step"]), float(data["amount"])
-            )
-
         result = RiskResult(
             transaction_id=data.get("transaction_id"),
             risk_score=risk,
@@ -188,7 +191,7 @@ class RiskEngine:
         shadow = None
         if self.shadow_model is not None:
             shadow = self._score_shadow(self.shadow_model, features, rules_score, result.decision)
-        return ScoredTransaction(result, shadow, features, int(data["step"]))
+        return ScoredTransaction(result, shadow, features, step)
 
     def _observe_features(self, features: Mapping[str, float]) -> None:
         assert self.feature_observer is not None

@@ -31,8 +31,8 @@ sequenceDiagram
     C->>A: POST /v1/score {transaction}
     A->>A: Pydantic validation (rejects isFraud / unknown fields → 422)
     A->>E: score(txn)
-    E->>S: snapshot(nameOrig, nameDest, step)
-    Note right of S: Only events BEFORE this one
+    E->>S: snapshot_and_record(nameOrig, nameDest, step, amount)
+    Note right of S: Atomic: snapshot of events BEFORE this one,<br/>then record it
     S-->>E: VelocitySnapshot
     E->>E: compute_features(txn, snapshot)
     E->>R: evaluate_rules(txn, snapshot)
@@ -111,6 +111,12 @@ A malformed shadow artifact fails startup, so a bad rollout is caught by readine
 than silently running without the comparison. The streaming consumer scores without a
 shadow comparison for now.
 
+Shadow metrics measure disagreement, not correctness. Once delayed labels arrive,
+`python -m fraud_engine.promote` replays the feedback log's unseen tail (after every
+model's training window + embargo) through the live and candidate artifacts and exits 0
+only if the candidate's PR-AUC and recall are within the configured tolerance of live.
+Promotion itself (swapping `FRE_MODEL_PATH`) stays a manual, reviewed step.
+
 ## 5. CI/CD and branch promotion
 
 ```mermaid
@@ -128,9 +134,9 @@ flowchart LR
 
 | Concern | Today (starter) | Next step |
 |---|---|---|
-| Velocity state | In-process deques by default; `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
+| Velocity state | In-process deques by default (idle account keys evicted once every event has left the window, so memory tracks active accounts, not all accounts ever seen; parity-tested against a non-evicting store); `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Snapshot+record is atomic (lock / `WATCH`-`MULTI`); per-account partitioning still needed for a defined order *within* a step |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once), with consumer-group rebalance hooks and textfile metrics | Per-partition watermarks; consumer lag in the metrics file |
-| Feedback | `POST /v1/labels` joins labels to served decisions; optional JSONL feedback log of served features + labels | Label ingestion (chargebacks) → delayed-label retraining → shadow deployment |
+| Feedback | `POST /v1/labels` joins labels to served decisions; optional JSONL feedback log of served features + labels; `train --feedback` retrains a candidate for shadow deployment; `fraud_engine.promote` gates candidate vs live on the unseen labelled tail | Scheduled retrain + gate in CI |
 | Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |

@@ -1,3 +1,8 @@
+from fastapi.testclient import TestClient
+
+from fraud_engine.api import create_app
+from fraud_engine.config import Settings
+
 from .conftest import fraud_txn, make_txn
 
 
@@ -112,3 +117,18 @@ def test_nonfinite_transaction_values_rejected(client):
         for invalid in ("NaN", "Infinity", "-Infinity"):
             response = client.post("/v1/score", json=make_txn(**{field: invalid}))
             assert response.status_code == 422, (field, invalid, response.text)
+
+
+def test_metrics_endpoint_exports_velocity_store_size_and_evictions():
+    app = create_app(Settings(velocity_window_steps=2))
+    with TestClient(app) as c:
+        c.post("/v1/score", json=make_txn(step=1, nameOrig="C1", nameDest="M1"))
+        c.post("/v1/score", json=make_txn(step=2, nameOrig="C2", nameDest="M2"))
+        text = c.get("/metrics").text
+        assert "fre_velocity_keys 4" in text
+        assert "fre_velocity_evicted_keys_total 0" in text
+        # Step 5: everything at step <= 3 is outside the window -> C1/M1 and C2/M2 evicted.
+        c.post("/v1/score", json=make_txn(step=5, nameOrig="C3", nameDest="M3"))
+        text = c.get("/metrics").text
+        assert "fre_velocity_keys 2" in text
+        assert "fre_velocity_evicted_keys_total 4" in text

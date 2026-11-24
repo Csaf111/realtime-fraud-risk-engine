@@ -81,6 +81,10 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 
 Every response carries an `x-request-id` header. The API echoes yours or generates one.
 
+Request bodies are capped at `FRE_MAX_BODY_BYTES` (2 MiB by default) **before** any JSON is
+parsed, so an oversized payload is refused with `413` without being buffered or decoded,
+including chunked uploads without a `Content-Length`.
+
 ### Monitoring metrics
 
 `/metrics` exports, alongside request/decision counts and scoring latency:
@@ -94,6 +98,8 @@ Every response carries an `x-request-id` header. The API echoes yours or generat
 | `fre_score_drift_window_count` | gauge | Live scores currently in the drift window |
 | `fre_feature_psi{feature}` | gauge | PSI of each model input over the last `FRE_DRIFT_WINDOW` transactions vs the training feature reference (only with `FRE_FEATURE_REFERENCE_PATH`, once warm) |
 | `fre_feature_drift_window_count` | gauge | Feature vectors currently in the feature drift window |
+| `fre_velocity_keys` | gauge | Account keys held by the in-memory velocity store (bounded by accounts active in the last `FRE_VELOCITY_WINDOW_STEPS`) |
+| `fre_velocity_evicted_keys_total` | counter | Idle velocity keys evicted once all their events left the window (in-memory backend only) |
 | `fre_feature_drift_skipped_total` | counter | Feature vectors skipped because a value was non-finite |
 | `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
 | `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
@@ -224,6 +230,43 @@ are best-effort: failures increment `fre_feedback_write_errors_total` and never 
 features are retained in memory. With several replicas, give each its own file and
 concatenate (`feedback_dataset` dedupes by id).
 
+#### Retraining from the feedback log
+
+```bash
+# Concatenate replica logs, retrain a candidate on the served vectors, write a feature reference
+python -m fraud_engine.train --feedback data/feedback.jsonl --out models/candidate.json --model gbt
+# Deploy it next to the live model; compare via fre_shadow_* before any promotion
+FRE_SHADOW_MODEL_PATH=models/candidate.json uvicorn fraud_engine.api:app
+```
+
+`--feedback` reuses the PaySim pipeline's temporal split, embargo gap (`--gap-steps`) and
+`leakage_checks`, so the candidate is evaluated on later, unseen labelled traffic. Its
+metrics report the candidate (`model`) next to the live engine's own logged scores on the
+same test window (`served_baseline`): the bar a candidate must clear. The logged score is a
+baseline only and never a feature. The log holds no raw transactions, so rules cannot be
+re-run: `--review-budget`/`--block-budget` and `--rules-floor` are rejected and no blended
+score reference is written (the per-feature drift reference is). Labelled traffic is a
+selected sample (mostly what was reviewed or charged back), so treat the test metrics as
+optimistic and let shadow agreement decide promotion.
+
+#### Promotion gate
+
+Shadow metrics show how often a candidate disagrees with live, not which one is right. Once
+more labels have arrived, replay the feedback log through both artifacts and gate on it:
+
+```bash
+python -m fraud_engine.promote --live models/baseline.json --candidate models/candidate.json \
+    --feedback data/feedback.jsonl --max-pr-auc-drop 0 --max-recall-drop 0 \
+    --report reports/promotion.json   # exit 0 = PASS, 1 = FAIL or too little evidence
+```
+
+Both models score the served feature vectors (no labels, ids, `step` or logged scores), and
+the report gives live vs candidate PR-AUC/ROC-AUC/precision/recall, the deltas, decision
+agreement and fraud newly caught/missed. The evaluation window starts after the training
+window + embargo of any model trained with `--feedback` (read from its metadata); an
+`--after-step` inside it is a `LeakageError`. A window with fewer than `--min-positives`
+labelled frauds (or no legitimate rows) is refused, never passed.
+
 ### Request
 
 Field names match the PaySim columns, so a dataset row can be posted as-is once you remove
@@ -319,9 +362,14 @@ FRE_VELOCITY_BACKEND=redis FRE_REDIS_URL=redis://localhost:6379/0 make run
 
 `RedisVelocityStore` implements the same `VelocityBackend` interface and window semantics
 as the in-memory store; a parity test replays a random step-ordered stream through both
-and requires identical snapshots. `snapshot` and `record` are separate round trips, so
-two replicas scoring the *same account* concurrently can miss each other's in-flight
-event; partition traffic by account if you need a strict order.
+and requires identical snapshots. Serving reads and writes velocity in one atomic
+`snapshot_and_record` step: a single lock in memory, an optimistic `WATCH`/`MULTI`
+transaction in Redis (retried on conflict, `VelocityContentionError` after
+`max_atomic_retries`). A burst of concurrent transactions on the *same account*, even
+across replicas, is therefore serialised: the k-th event sees the k-1 before it instead of
+all of them reading the same stale count and slipping under the velocity rules. Events in
+the same step still have no defined order between them; partition traffic by account if
+you need a strict order.
 
 ## Training on PaySim
 
@@ -467,6 +515,8 @@ make lint typecheck
 | `test_drift.py` | PSI maths, score reference round-trip and validation, rolling window, `/metrics` export, label-independent reference from the training window |
 | `test_outcomes.py` | Delayed-label join: matched/unknown/duplicate, bounded buffers, rolling precision/recall, `/v1/labels`, labels never change later scores |
 | `test_feedback.py` | Feedback log: record round-trip and contract validation, time-ordered deduped dataset without metadata, best-effort writes, logged vector equals the online features end to end |
+| `test_train_feedback.py` | Feedback retraining: deduped time-ordered frame without ids, temporal split + embargo + leakage checks, served score as baseline only, candidate loads as a shadow model, CLI guards |
+| `test_promote.py` | Promotion gate: default window equals the candidate's unseen test window, overlap with training data is a `LeakageError`, better candidate passes / worse fails with reasons, tolerances, labels never change scores, thin evidence refused, CLI exit codes + report |
 | `test_feature_drift.py` | Quantile binning, feature reference round-trip and `FEATURE_NAMES` guard, monitor pinpoints the moved input, engine observer hook, `/metrics` export, label-independent reference from the training window |
 
 ## Docker
@@ -511,6 +561,7 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_VELOCITY_WINDOW_STEPS` | `24` | Velocity look-back (PaySim steps = hours) |
 | `FRE_HIGH_AMOUNT_THRESHOLD` | `200000` | R003 threshold |
 | `FRE_MAX_BATCH_SIZE` | `1000` | Batch endpoint limit |
+| `FRE_MAX_BODY_BYTES` | `2097152` | Max request body (bytes), enforced before JSON parsing: oversized `Content-Length` or streamed bodies get `413`, malformed `Content-Length` gets `400`. Must fit a full batch (~300 B per transaction) |
 | `FRE_ENVIRONMENT` | `local` | Reported by `/ready` |
 | `FRE_VELOCITY_BACKEND` | `memory` | `memory` (per process) or `redis` (shared across replicas; needs the `redis` extra) |
 | `FRE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL for the `redis` backend |
@@ -541,6 +592,7 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── artifacts.py       Model artifact loader (dispatch on model_type)
 │   ├── preprocessing.py   Leakage-safe PaySim pipeline + checks
 │   ├── train.py           Training CLI
+│   ├── promote.py         Offline promotion gate: candidate vs live on labelled feedback
 │   ├── synthetic.py       PaySim-shaped generator for CI
 │   ├── schemas.py         Pydantic request/response models
 │   ├── metrics.py         Prometheus-format metrics
@@ -569,9 +621,13 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Feature-level drift: PSI per input feature (`FRE_FEATURE_REFERENCE_PATH`, `fre_feature_psi{feature}`)
 - [x] Label-delayed performance monitoring (`POST /v1/labels`, `fre_label_precision` / `fre_label_recall`)
 - [x] Shadow model deployments (`FRE_SHADOW_MODEL_PATH`, `fre_shadow_*` agreement metrics)
-- [ ] Delayed-label feedback loop
+- [x] Delayed-label feedback loop
   - [x] Capture: served features joined to delayed labels in a JSONL log (`FRE_FEEDBACK_LOG_PATH`, `read_feedback` / `feedback_dataset`)
-  - [ ] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model
+  - [x] Retrain from the feedback log (`train --feedback`) and deploy the result as a shadow model (`FRE_SHADOW_MODEL_PATH`)
+  - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
+- [x] Request body size limit enforced before JSON parsing (`FRE_MAX_BODY_BYTES`, `413` / `400`)
+- [x] Bounded in-memory velocity state: idle account keys evicted once outside the window, snapshot-exact (`fre_velocity_keys`, `fre_velocity_evicted_keys_total`)
+- [x] Atomic velocity read-then-write (`snapshot_and_record`): concurrent bursts on one account can't share a stale snapshot (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries)
 
 ## Acknowledgements
 

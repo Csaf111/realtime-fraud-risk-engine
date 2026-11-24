@@ -27,9 +27,9 @@ flowchart LR
 
 | Threat | Current posture | Required production control |
 |---|---|---|
-| Unauthenticated high-volume scoring or scraping | No built-in authentication or rate limiting | Gateway authentication, quotas, request-size limits and abuse monitoring |
+| Unauthenticated high-volume scoring or scraping | No built-in authentication or rate limiting; request bodies capped at `FRE_MAX_BODY_BYTES` before JSON parsing (`413`), batches at `FRE_MAX_BATCH_SIZE` | Gateway authentication, quotas, edge request-size limits and abuse monitoring |
 | Transaction replay or duplicate events corrupt velocity counts | No durable idempotency contract | Authenticated idempotency key, bounded retention, deduplication and replay tests |
-| Concurrent requests race on velocity state | In-memory state is process-local; Redis proposal still has snapshot/record race | Partition by account or implement atomic snapshot-and-record with ordered event handling |
+| Concurrent requests race on velocity state | Mitigated: snapshot and record are one atomic step (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries), so a parallel burst can't share a stale count | Same-step events remain unordered and retries are not idempotent; partition by account and add idempotency keys |
 | Post-authorisation information contaminates a decision | v1 rules/features reference post-transaction balances | Versioned pre-authorisation request contract, new feature schema and retraining; do not use v1 for payment authorisation |
 | Malformed/poisoned training data | Data ingestion validation is being improved | Schema checks, finite-number checks, provenance, immutable datasets and reproducible splits |
 | Compromised model artifact | Local artifact load; validation proposals exist | Digest/signature verification, trusted storage, review/approval and rollback |

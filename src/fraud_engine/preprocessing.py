@@ -24,7 +24,7 @@ import pandas as pd
 
 from .features import FEATURE_NAMES, compute_features
 from .rules import RuleContext, evaluate_rules
-from .state import VelocityStore
+from .state import VelocityStore, snapshot_and_record
 
 PAYSIM_COLUMNS: tuple[str, ...] = (
     "step",
@@ -132,11 +132,13 @@ def build_feature_frame(df: pd.DataFrame, window_steps: int = 24) -> pd.DataFram
     for rec in df[feature_cols].itertuples(index=False):
         txn = rec._asdict()
         txn["type"] = str(txn["type"])
-        snap = store.snapshot(txn["nameOrig"], txn["nameDest"], int(txn["step"]))
+        # Same atomic snapshot-then-record call as serving (online/offline parity).
+        snap = snapshot_and_record(
+            store, txn["nameOrig"], txn["nameDest"], int(txn["step"]), float(txn["amount"])
+        )
         feats = compute_features(txn, snap)
         rows.append([feats[f] for f in FEATURE_NAMES])
         rules_scores.append(evaluate_rules(txn, snap, ctx)[0])
-        store.record(txn["nameOrig"], txn["nameDest"], int(txn["step"]), float(txn["amount"]))
 
     out = pd.DataFrame(rows, columns=list(FEATURE_NAMES))
     out["rules_score"] = rules_scores
