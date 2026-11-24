@@ -24,3 +24,31 @@ single-process velocity store, PaySim's synthetic ordering and its step clock.
 Do not use it as a production fraud processor. API authentication,
 idempotency, concurrent event ordering and online/offline feature parity
 remain separate release gates.
+
+
+## Chronological holdout handoff
+
+Export the same rules scores used by the exploratory replay:
+
+```bash
+python -m fraud_engine.preauth_replay PaySim.csv --export-scores causal_scores.csv
+```
+
+Once the temporal evaluation implementation (PR #26) is available in the
+same environment, run:
+
+```bash
+python -m fraud_engine.holdout_cli causal_scores.csv > holdout-report.json
+```
+
+The intermediate CSV contains only step, score and isFraud, in original
+row order. The scorer sees pre-authorisation fields and prior replay state,
+not labels. Same-step ordering follows the source file; it is not proof of
+real-world event ordering. State is carried forward across split boundaries,
+as in an online replay; embargo excludes evaluation rows, not historical
+state updates. Export requires a new output path and removes partial files
+on ordinary exceptions. Do not commit transaction-level exports, even
+without account identifiers. The export streams rows but velocity state
+has its own memory requirements. The holdout evaluator still loads scores
+into memory. No trained model or measured holdout results are supplied by
+this change.
