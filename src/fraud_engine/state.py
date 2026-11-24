@@ -7,6 +7,17 @@ they are served. That removes a whole class of train/serve skew.
 Leakage guarantee: ``snapshot()`` is always called *before* ``record()`` for the current
 event, so a transaction never sees itself or anything that happened after it.
 
+Atomic read-then-write: serving calls :func:`snapshot_and_record`, which takes the
+point-in-time snapshot and records the event as one atomic step (a single lock acquisition
+in memory, an optimistic ``WATCH``/``MULTI`` transaction in Redis). With separate
+``snapshot`` and ``record`` calls, N concurrent requests for the same account could all
+snapshot before any of them recorded, so every one of them would see the same (stale)
+velocity: a burst of parallel transactions, exactly the pattern velocity rules exist to
+catch, could slip under them. Atomicity serialises the burst so the k-th event sees the k-1
+before it. The snapshot is still taken strictly before the event is added, so the leakage
+guarantee and online/offline parity are unchanged (offline feature building uses the same
+call).
+
 Idle-key eviction: the in-memory store drops an account's key once every event it holds has
 left the window behind the newest recorded step (the "high-water" step). Without this, every
 account ever seen would keep an (empty) entry forever, and a long-running replica scoring a
@@ -105,24 +116,43 @@ class VelocityStore:
     def snapshot(self, name_orig: str, name_dest: str, step: int) -> VelocitySnapshot:
         """Return activity strictly before the current event, within the window."""
         with self._lock:
-            oc, osum = self._window(self._orig.get(name_orig, deque()), step)
-            dc, dsum = self._window(self._dest.get(name_dest, deque()), step)
-        return VelocitySnapshot(oc, osum, dc, dsum)
+            return self._snapshot_locked(name_orig, name_dest, step)
 
     def record(self, name_orig: str, name_dest: str, step: int, amount: float) -> None:
         with self._lock:
-            if self._high_water is None or step > self._high_water:
-                self._high_water = step
-                if self.evict_idle:
-                    self.evicted_keys += self._evict_idle_locked()
-            o = self._orig[name_orig]
-            o.append((step, amount))
-            self._prune(o, step)
-            d = self._dest[name_dest]
-            d.append((step, amount))
-            self._prune(d, step)
-            self._touch((0, name_orig), step)
-            self._touch((1, name_dest), step)
+            self._record_locked(name_orig, name_dest, step, amount)
+
+    def snapshot_and_record(
+        self, name_orig: str, name_dest: str, step: int, amount: float
+    ) -> VelocitySnapshot:
+        """Snapshot activity before this event, then record it, under one lock.
+
+        Equivalent to ``snapshot`` followed by ``record``, except no other thread can
+        record an event for the same accounts in between.
+        """
+        with self._lock:
+            snap = self._snapshot_locked(name_orig, name_dest, step)
+            self._record_locked(name_orig, name_dest, step, amount)
+        return snap
+
+    def _snapshot_locked(self, name_orig: str, name_dest: str, step: int) -> VelocitySnapshot:
+        oc, osum = self._window(self._orig.get(name_orig, deque()), step)
+        dc, dsum = self._window(self._dest.get(name_dest, deque()), step)
+        return VelocitySnapshot(oc, osum, dc, dsum)
+
+    def _record_locked(self, name_orig: str, name_dest: str, step: int, amount: float) -> None:
+        if self._high_water is None or step > self._high_water:
+            self._high_water = step
+            if self.evict_idle:
+                self.evicted_keys += self._evict_idle_locked()
+        o = self._orig[name_orig]
+        o.append((step, amount))
+        self._prune(o, step)
+        d = self._dest[name_dest]
+        d.append((step, amount))
+        self._prune(d, step)
+        self._touch((0, name_orig), step)
+        self._touch((1, name_dest), step)
 
     def _touch(self, side_key: tuple[int, str], step: int) -> None:
         newest = self._newest.get(side_key)
@@ -178,6 +208,31 @@ class VelocityStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._orig) + len(self._dest)
+
+
+@runtime_checkable
+class AtomicVelocityBackend(VelocityBackend, Protocol):
+    """A backend that can snapshot-then-record one event atomically."""
+
+    def snapshot_and_record(
+        self, name_orig: str, name_dest: str, step: int, amount: float
+    ) -> VelocitySnapshot: ...
+
+
+def snapshot_and_record(
+    store: VelocityBackend, name_orig: str, name_dest: str, step: int, amount: float
+) -> VelocitySnapshot:
+    """Return the point-in-time snapshot for an event, then record the event.
+
+    Uses the backend's atomic ``snapshot_and_record`` when it has one (both built-in stores
+    do); a custom backend without it falls back to ``snapshot`` then ``record``, which is
+    correct for a single writer but not atomic under concurrency.
+    """
+    if isinstance(store, AtomicVelocityBackend):
+        return store.snapshot_and_record(name_orig, name_dest, step, amount)
+    snap = store.snapshot(name_orig, name_dest, step)
+    store.record(name_orig, name_dest, step, amount)
+    return snap
 
 
 def build_velocity_store(settings: Settings) -> VelocityBackend:

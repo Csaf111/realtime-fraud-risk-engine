@@ -31,8 +31,8 @@ sequenceDiagram
     C->>A: POST /v1/score {transaction}
     A->>A: Pydantic validation (rejects isFraud / unknown fields → 422)
     A->>E: score(txn)
-    E->>S: snapshot(nameOrig, nameDest, step)
-    Note right of S: Only events BEFORE this one
+    E->>S: snapshot_and_record(nameOrig, nameDest, step, amount)
+    Note right of S: Atomic: snapshot of events BEFORE this one,<br/>then record it
     S-->>E: VelocitySnapshot
     E->>E: compute_features(txn, snapshot)
     E->>R: evaluate_rules(txn, snapshot)
@@ -134,7 +134,7 @@ flowchart LR
 
 | Concern | Today (starter) | Next step |
 |---|---|---|
-| Velocity state | In-process deques by default (idle account keys evicted once every event has left the window, so memory tracks active accounts, not all accounts ever seen; parity-tested against a non-evicting store); `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Atomic snapshot+record (Lua) or per-account partitioning for strict ordering under concurrency |
+| Velocity state | In-process deques by default (idle account keys evicted once every event has left the window, so memory tracks active accounts, not all accounts ever seen; parity-tested against a non-evicting store); `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Snapshot+record is atomic (lock / `WATCH`-`MULTI`); per-account partitioning still needed for a defined order *within* a step |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once), with consumer-group rebalance hooks and textfile metrics | Per-partition watermarks; consumer lag in the metrics file |
