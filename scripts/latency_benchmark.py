@@ -1,8 +1,11 @@
 """Bounded HTTP load probe for local or explicitly authorised test environments.
 
 No third-party dependencies. Uses unique synthetic account identifiers per request
-to avoid contaminating velocity state across measurements.
+to avoid contaminating velocity state across measurements. Transaction ids also carry
+a per-run nonce: the API answers a repeated ``transaction_id`` from its idempotency cache,
+so re-running the probe against the same server must not measure cache replays.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -12,7 +15,10 @@ import statistics
 import time
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+RUN_ID = uuid.uuid4().hex[:12]
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -28,30 +34,34 @@ def percentile(values: list[float], pct: float) -> float:
 
 def payload(index: int) -> bytes:
     """Synthetic transaction with isolated account keys."""
-    return json.dumps({
-        "transaction_id": f"bench-{index}",
-        "step": 10,
-        "type": "PAYMENT",
-        "amount": 25.0,
-        "nameOrig": f"CbenchOrigin{index}",
-        "oldbalanceOrg": 1000.0,
-        "newbalanceOrig": 975.0,
-        "nameDest": f"MbenchMerchant{index}",
-        "oldbalanceDest": 0.0,
-        "newbalanceDest": 25.0,
-    }).encode("utf-8")
+    return json.dumps(
+        {
+            "transaction_id": f"bench-{RUN_ID}-{index}",
+            "step": 10,
+            "type": "PAYMENT",
+            "amount": 25.0,
+            "nameOrig": f"CbenchOrigin{index}",
+            "oldbalanceOrg": 1000.0,
+            "newbalanceOrig": 975.0,
+            "nameDest": f"MbenchMerchant{index}",
+            "oldbalanceDest": 0.0,
+            "newbalanceDest": 25.0,
+        }
+    ).encode("utf-8")
 
 
 def probe(url: str, index: int, timeout: float) -> tuple[float, bool, str]:
     request = urllib.request.Request(
-        url, data=payload(index), headers={"Content-Type": "application/json"},
+        url,
+        data=payload(index),
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
     start = time.perf_counter()
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = json.load(response)
-            ok = response.status == 200 and body.get("transaction_id") == f"bench-{index}"
+            ok = response.status == 200 and body.get("transaction_id") == f"bench-{RUN_ID}-{index}"
             return (time.perf_counter() - start) * 1000, ok, "" if ok else "invalid_response"
     except urllib.error.HTTPError as exc:
         return (time.perf_counter() - start) * 1000, False, f"http_{exc.code}"
@@ -82,13 +92,17 @@ def run(url: str, requests: int, concurrency: int, timeout: float, warmup: int) 
         "throughput_rps": round(requests / elapsed, 2) if elapsed else None,
         "successes": len(successes),
         "failures": failures,
-        "latency_ms": ({
-            "mean": round(statistics.mean(successes), 3),
-            "p50": round(percentile(successes, 50), 3),
-            "p95": round(percentile(successes, 95), 3),
-            "p99": round(percentile(successes, 99), 3),
-            "max": round(max(successes), 3),
-        } if successes else None),
+        "latency_ms": (
+            {
+                "mean": round(statistics.mean(successes), 3),
+                "p50": round(percentile(successes, 50), 3),
+                "p95": round(percentile(successes, 95), 3),
+                "p99": round(percentile(successes, 99), 3),
+                "max": round(max(successes), 3),
+            }
+            if successes
+            else None
+        ),
     }
 
 

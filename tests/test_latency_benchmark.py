@@ -1,4 +1,5 @@
 """Contract tests for the standalone load probe (no server required)."""
+
 import importlib.util
 from pathlib import Path
 
@@ -29,13 +30,16 @@ def test_payload_is_unique_and_contains_no_labels():
     second = json.loads(benchmark.payload(2))
     assert first["nameOrig"] != second["nameOrig"]
     assert first["transaction_id"] != second["transaction_id"]
+    # Per-run nonce: a re-run against the same server must not hit the idempotency cache.
+    assert benchmark.RUN_ID in first["transaction_id"]
     assert "isFraud" not in first
     assert "isFlaggedFraud" not in first
 
 
 def test_run_summary_with_mock_probe(monkeypatch):
     monkeypatch.setattr(
-        benchmark, "probe",
+        benchmark,
+        "probe",
         lambda _url, i, _timeout: (float(i + 1), i % 2 == 0, "" if i % 2 == 0 else "http_503"),
     )
     result = benchmark.run("http://localhost:8000/v1/score", 4, 2, 1.0, 0)
@@ -45,9 +49,15 @@ def test_run_summary_with_mock_probe(monkeypatch):
     assert result["throughput_rps"] > 0
 
 
-@pytest.mark.parametrize("requests,concurrency,timeout,warmup", [
-    (0, 1, 1, 0), (1, 0, 1, 0), (1, 1, 0, 0), (1, 1, 1, -1),
-])
+@pytest.mark.parametrize(
+    "requests,concurrency,timeout,warmup",
+    [
+        (0, 1, 1, 0),
+        (1, 0, 1, 0),
+        (1, 1, 0, 0),
+        (1, 1, 1, -1),
+    ],
+)
 def test_invalid_configuration(requests, concurrency, timeout, warmup):
     with pytest.raises(ValueError):
         benchmark.run("http://localhost:8000/v1/score", requests, concurrency, timeout, warmup)

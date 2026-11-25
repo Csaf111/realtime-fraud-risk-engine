@@ -63,6 +63,9 @@ class Settings:
         feedback_log_path: optional JSONL file. When set, every label that joins a served
             decision appends ``(served features, label)`` there for offline retraining
             (see :mod:`fraud_engine.feedback`). Requires label tracking to be enabled.
+        idempotency_capacity: most recent ``transaction_id`` results kept so a retried
+            request gets its original decision without re-recording velocity (see
+            :mod:`fraud_engine.idempotency`). ``0`` disables idempotent replay.
     """
 
     review_threshold: float = 0.5
@@ -86,6 +89,7 @@ class Settings:
     label_pending_capacity: int = 100_000
     label_window: int = 5000
     feedback_log_path: str | None = None
+    idempotency_capacity: int = 100_000
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -114,6 +118,8 @@ class Settings:
             raise ValueError("label_window must be >= 1")
         if self.feedback_log_path and self.label_pending_capacity == 0:
             raise ValueError("feedback_log_path requires label_pending_capacity > 0")
+        if self.idempotency_capacity < 0:
+            raise ValueError("idempotency_capacity must be >= 0")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -139,4 +145,5 @@ class Settings:
             label_pending_capacity=_int("FRE_LABEL_PENDING_CAPACITY", 100_000),
             label_window=_int("FRE_LABEL_WINDOW", 5000),
             feedback_log_path=os.getenv("FRE_FEEDBACK_LOG_PATH") or None,
+            idempotency_capacity=_int("FRE_IDEMPOTENCY_CAPACITY", 100_000),
         )
