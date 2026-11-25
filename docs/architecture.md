@@ -30,6 +30,9 @@ sequenceDiagram
 
     C->>A: POST /v1/score {transaction}
     A->>A: Pydantic validation (rejects isFraud / unknown fields → 422)
+    opt transaction_id seen before (IdempotencyCache)
+        A-->>C: 200 original result (x-idempotent-replay), or 409 if the payload differs
+    end
     A->>E: score(txn)
     E->>S: snapshot_and_record(nameOrig, nameDest, step, amount)
     Note right of S: Atomic: snapshot of events BEFORE this one,<br/>then record it
@@ -136,6 +139,7 @@ flowchart LR
 |---|---|---|
 | Velocity state | In-process deques by default (idle account keys evicted once every event has left the window, so memory tracks active accounts, not all accounts ever seen; parity-tested against a non-evicting store); `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Snapshot+record is atomic (lock / `WATCH`-`MULTI`); per-account partitioning still needed for a defined order *within* a step |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
+| Retries | Idempotent per `transaction_id`: in-memory, bounded replay cache per replica (`FRE_IDEMPOTENCY_CAPACITY`), so retries don't re-record velocity | Shared (Redis `SET NX`) idempotency keys, or route by `transaction_id`, so a retry landing on another replica also replays |
 | Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once), with consumer-group rebalance hooks and textfile metrics | Per-partition watermarks; consumer lag in the metrics file |
 | Feedback | `POST /v1/labels` joins labels to served decisions; optional JSONL feedback log of served features + labels; `train --feedback` retrains a candidate for shadow deployment; `fraud_engine.promote` gates candidate vs live on the unseen labelled tail | Scheduled retrain + gate in CI |

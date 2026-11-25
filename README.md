@@ -85,6 +85,17 @@ Request bodies are capped at `FRE_MAX_BODY_BYTES` (2 MiB by default) **before** 
 parsed, so an oversized payload is refused with `413` without being buffered or decoded,
 including chunked uploads without a `Content-Length`.
 
+Scoring is **idempotent per `transaction_id`**. Retrying a request with the same id and the
+same payload returns the original result (with an `x-idempotent-replay: true` header) and
+does not record the transaction in velocity state again, so a client or gateway retry can't
+inflate its own account's velocity or get a harsher decision the second time. The same id
+with a *different* payload is rejected with `409`; a duplicate that arrives while the first
+is still being scored waits for it (or gets `503` + `Retry-After` after 5 s). The batch
+endpoint applies the same rule to every transaction it records, rejects a batch that
+reuses one id for different payloads before scoring any of it, and what-if batches
+(`update_state: false`) bypass the cache. The last `FRE_IDEMPOTENCY_CAPACITY` ids are kept
+per replica; requests without a `transaction_id` are always scored.
+
 ### Monitoring metrics
 
 `/metrics` exports, alongside request/decision counts and scoring latency:
@@ -100,6 +111,9 @@ including chunked uploads without a `Content-Length`.
 | `fre_feature_drift_window_count` | gauge | Feature vectors currently in the feature drift window |
 | `fre_velocity_keys` | gauge | Account keys held by the in-memory velocity store (bounded by accounts active in the last `FRE_VELOCITY_WINDOW_STEPS`) |
 | `fre_velocity_evicted_keys_total` | counter | Idle velocity keys evicted once all their events left the window (in-memory backend only) |
+| `fre_idempotent_replays_total` | counter | Retried `transaction_id`s answered from the idempotency cache (not re-scored or re-observed) |
+| `fre_idempotency_conflicts_total` | counter | `transaction_id`s reused with a different payload (`409`) |
+| `fre_idempotency_keys`, `fre_idempotency_evicted_total` | gauge / counter | Ids held for replay; oldest ids evicted at `FRE_IDEMPOTENCY_CAPACITY` |
 | `fre_feature_drift_skipped_total` | counter | Feature vectors skipped because a value was non-finite |
 | `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
 | `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
@@ -574,6 +588,7 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_LABEL_PENDING_CAPACITY` | `100000` | Served decisions kept awaiting a delayed label (`0` disables `/v1/labels`) |
 | `FRE_LABEL_WINDOW` | `5000` | Labelled outcomes in the rolling precision/recall window |
 | `FRE_FEEDBACK_LOG_PATH` | unset | JSONL file of served features joined to delayed labels, for retraining |
+| `FRE_IDEMPOTENCY_CAPACITY` | `100000` | Recent `transaction_id` results kept so retries replay the original decision (`0` disables) |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -627,6 +642,7 @@ are in [docs/cicd.md](docs/cicd.md).
   - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
 - [x] Request body size limit enforced before JSON parsing (`FRE_MAX_BODY_BYTES`, `413` / `400`)
 - [x] Bounded in-memory velocity state: idle account keys evicted once outside the window, snapshot-exact (`fre_velocity_keys`, `fre_velocity_evicted_keys_total`)
+- [x] Idempotent scoring per `transaction_id`: retries replay the original result without re-recording velocity; reused id + different payload → `409` (`FRE_IDEMPOTENCY_CAPACITY`, `fre_idempotent_replays_total`)
 - [x] Atomic velocity read-then-write (`snapshot_and_record`): concurrent bursts on one account can't share a stale snapshot (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries)
 
 ## Acknowledgements
