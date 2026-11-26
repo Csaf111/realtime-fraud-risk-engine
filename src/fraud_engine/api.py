@@ -17,7 +17,13 @@ from .config import Settings
 from .drift import DriftMonitor, ScoreReference
 from .feature_drift import FeatureDriftMonitor, FeatureReference
 from .feedback import FeedbackLog
-from .idempotency import IdempotencyCache, IdempotencyConflictError, LookupStatus, fingerprint
+from .idempotency import (
+    IdempotencyBackend,
+    IdempotencyConflictError,
+    LookupStatus,
+    build_idempotency_store,
+    fingerprint,
+)
 from .limits import BodySizeLimitMiddleware
 from .metrics import Metrics
 from .outcomes import LabelStatus, OutcomeTracker
@@ -64,7 +70,7 @@ def _observe(m: Metrics, scored: ScoredTransaction, served: bool = True) -> None
 
 
 def _score_served(
-    eng: RiskEngine, m: Metrics, cache: IdempotencyCache | None, txn: Transaction
+    eng: RiskEngine, m: Metrics, cache: IdempotencyBackend | None, txn: Transaction
 ) -> tuple[RiskResult, bool]:
     """Score a state-updating transaction once per ``transaction_id``.
 
@@ -136,11 +142,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         if feature_drift is not None:
             app.state.engine.feature_observer = feature_drift.observe
         store = app.state.engine.store
-        app.state.idempotency = (
-            IdempotencyCache(settings.idempotency_capacity)
-            if settings.idempotency_capacity
-            else None
-        )
+        app.state.idempotency = build_idempotency_store(settings)
         app.state.metrics = Metrics(
             drift=_drift_monitor(settings),
             feature_drift=feature_drift,
@@ -230,7 +232,7 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         eng: RiskEngine = request.app.state.engine
         m: Metrics = request.app.state.metrics
         m.request("score_batch")
-        cache: IdempotencyCache | None = request.app.state.idempotency
+        cache: IdempotencyBackend | None = request.app.state.idempotency
         if batch.update_state and cache is not None:
             _check_batch_ids(batch.transactions)
         results = []

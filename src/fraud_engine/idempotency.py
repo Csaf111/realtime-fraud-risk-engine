@@ -30,8 +30,11 @@ Leakage: the cache keys on ``transaction_id`` only to *deduplicate requests*. No
 rule or model input ever reads the id, and the cached result was computed from the
 point-in-time state of the first request, so nothing from the future can leak in.
 
-State is per replica and in memory. With several replicas, route retries with the same id to
-the same replica (for example consistent hashing on ``transaction_id``), as for labels.
+State is per replica and in memory by default. With several replicas, either route retries
+with the same id to the same replica (for example consistent hashing on ``transaction_id``),
+or set ``FRE_IDEMPOTENCY_BACKEND=redis`` to share the claims and results across replicas
+(:class:`~fraud_engine.idempotency_redis.RedisIdempotencyStore`, same
+:class:`IdempotencyBackend` interface).
 
 Pure Python and stdlib only, so it adds nothing to the serving image.
 """
@@ -45,15 +48,20 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .schemas import RiskResult
 
+if TYPE_CHECKING:
+    from .config import Settings
+
 __all__ = [
+    "IdempotencyBackend",
     "IdempotencyCache",
     "IdempotencyConflictError",
     "Lookup",
     "LookupStatus",
+    "build_idempotency_store",
     "fingerprint",
 ]
 
@@ -83,6 +91,19 @@ def fingerprint(payload: Mapping[str, Any]) -> str:
     """Stable SHA-256 of a request payload (key order and float repr independent)."""
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@runtime_checkable
+class IdempotencyBackend(Protocol):
+    """What the API needs from an idempotency store (in-memory or shared)."""
+
+    def claim(self, transaction_id: str, payload_fingerprint: str) -> Lookup: ...
+
+    def complete(self, transaction_id: str, result: RiskResult) -> None: ...
+
+    def release(self, transaction_id: str) -> None: ...
+
+    def render(self) -> list[str]: ...
 
 
 @dataclass
@@ -211,3 +232,22 @@ class IdempotencyCache:
             "# TYPE fre_idempotency_evicted_total counter",
             f"fre_idempotency_evicted_total {evicted}",
         ]
+
+
+def build_idempotency_store(settings: Settings) -> IdempotencyBackend | None:
+    """Create the idempotency store configured by ``settings`` (``None`` when disabled).
+
+    ``memory`` (default) is a bounded per-process cache; ``redis`` shares claims and
+    results across replicas and needs the optional ``redis`` extra.
+    """
+    if settings.idempotency_capacity == 0:
+        return None
+    if settings.idempotency_backend == "redis":
+        from .idempotency_redis import RedisIdempotencyStore
+
+        return RedisIdempotencyStore.from_url(
+            settings.redis_url,
+            ttl_seconds=settings.idempotency_ttl_seconds,
+            key_prefix=settings.idempotency_key_prefix,
+        )
+    return IdempotencyCache(settings.idempotency_capacity)
