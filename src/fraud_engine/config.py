@@ -19,6 +19,7 @@ def _int(name: str, default: int) -> int:
 
 
 VELOCITY_BACKENDS = frozenset({"memory", "redis"})
+IDEMPOTENCY_BACKENDS = frozenset({"memory", "redis"})
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,13 @@ class Settings:
             (see :mod:`fraud_engine.feedback`). Requires label tracking to be enabled.
         idempotency_capacity: most recent ``transaction_id`` results kept so a retried
             request gets its original decision without re-recording velocity (see
-            :mod:`fraud_engine.idempotency`). ``0`` disables idempotent replay.
+            :mod:`fraud_engine.idempotency`). ``0`` disables idempotent replay (for either
+            backend). Only bounds the ``memory`` backend; Redis entries expire by TTL.
+        idempotency_backend: ``memory`` (per replica, default) or ``redis`` (claims and
+            results shared across replicas via ``redis_url``, so a retry that lands on
+            another replica also replays; requires the ``redis`` extra).
+        idempotency_ttl_seconds: how long the ``redis`` backend keeps a completed result.
+        idempotency_key_prefix: namespace for idempotency keys in Redis.
     """
 
     review_threshold: float = 0.5
@@ -90,6 +97,9 @@ class Settings:
     label_window: int = 5000
     feedback_log_path: str | None = None
     idempotency_capacity: int = 100_000
+    idempotency_backend: str = "memory"
+    idempotency_ttl_seconds: int = 86_400
+    idempotency_key_prefix: str = "fre:idempotency"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -120,6 +130,18 @@ class Settings:
             raise ValueError("feedback_log_path requires label_pending_capacity > 0")
         if self.idempotency_capacity < 0:
             raise ValueError("idempotency_capacity must be >= 0")
+        if self.idempotency_backend not in IDEMPOTENCY_BACKENDS:
+            raise ValueError(f"idempotency_backend must be one of {sorted(IDEMPOTENCY_BACKENDS)}")
+        if self.idempotency_ttl_seconds < 1:
+            raise ValueError("idempotency_ttl_seconds must be >= 1")
+        if not self.idempotency_key_prefix:
+            raise ValueError("idempotency_key_prefix must be non-empty")
+        if (
+            self.idempotency_backend == "redis"
+            and self.velocity_backend == "redis"
+            and self.idempotency_key_prefix == self.redis_key_prefix
+        ):
+            raise ValueError("idempotency_key_prefix must differ from redis_key_prefix")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -146,4 +168,7 @@ class Settings:
             label_window=_int("FRE_LABEL_WINDOW", 5000),
             feedback_log_path=os.getenv("FRE_FEEDBACK_LOG_PATH") or None,
             idempotency_capacity=_int("FRE_IDEMPOTENCY_CAPACITY", 100_000),
+            idempotency_backend=(os.getenv("FRE_IDEMPOTENCY_BACKEND") or "memory").strip().lower(),
+            idempotency_ttl_seconds=_int("FRE_IDEMPOTENCY_TTL_SECONDS", 86_400),
+            idempotency_key_prefix=os.getenv("FRE_IDEMPOTENCY_KEY_PREFIX") or "fre:idempotency",
         )

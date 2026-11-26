@@ -34,7 +34,8 @@ dropped once their events left the window) show that velocity state stays bounde
 Redis backend is not polled here: counting its keys needs a ``SCAN``, which is too expensive
 to run on every scrape (its keys expire through ``ttl_seconds`` instead).
 
-When an :class:`~fraud_engine.idempotency.IdempotencyCache` is attached,
+When an idempotency store (:class:`~fraud_engine.idempotency.IdempotencyCache` or the
+shared :class:`~fraud_engine.idempotency_redis.RedisIdempotencyStore`) is attached,
 ``fre_idempotent_replays_total`` counts retried ``transaction_id`` requests answered from the
 cache. Replays are *not* re-observed in the decision, score or drift series, so retries
 can't skew them.
@@ -48,7 +49,7 @@ from collections.abc import Iterable
 
 from .drift import SCORE_BUCKETS, DriftMonitor
 from .feature_drift import FeatureDriftMonitor
-from .idempotency import IdempotencyCache
+from .idempotency import IdempotencyBackend
 from .outcomes import OutcomeTracker
 from .state import VelocityStore
 
@@ -64,7 +65,7 @@ class Metrics:
         feature_drift: FeatureDriftMonitor | None = None,
         outcomes: OutcomeTracker | None = None,
         velocity: VelocityStore | None = None,
-        idempotency: IdempotencyCache | None = None,
+        idempotency: IdempotencyBackend | None = None,
     ) -> None:
         self.drift = drift
         self.idempotency = idempotency
