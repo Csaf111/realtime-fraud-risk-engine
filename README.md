@@ -76,10 +76,18 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 | `POST` | `/v1/labels` | Report delayed fraud labels for scored transactions (monitoring only) |
 | `GET` | `/v1/rules` | The rulebook (code, description, points) |
 | `GET` | `/health` | Liveness |
-| `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version |
+| `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version; pings Redis backends and returns `503` if one is unreachable |
 | `GET` | `/metrics` | Prometheus-format counters, latency histogram, per-rule hits, score histogram |
 
 Every response carries an `x-request-id` header. The API echoes yours or generates one.
+
+`/health` is liveness only (the process is up). `/ready` is the probe to route traffic on:
+when `FRE_VELOCITY_BACKEND=redis` or `FRE_IDEMPOTENCY_BACKEND=redis`, it pings each Redis
+backend on every call, reports `"dependencies": {"velocity_store": "ok", ...}`, and answers
+`503` with `"status": "not_ready"` while any of them is unreachable, so a load balancer stops
+sending a replica requests it would fail. It recovers on its own once Redis is back. Failures
+are reported as `error: <ExceptionType>` only; the full error (which may include the Redis
+host) goes to the log, never to the response.
 
 Request bodies are capped at `FRE_MAX_BODY_BYTES` (2 MiB by default) **before** any JSON is
 parsed, so an oversized payload is refused with `413` without being buffered or decoded,
@@ -662,6 +670,7 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Idempotent scoring per `transaction_id`: retries replay the original result without re-recording velocity; reused id + different payload → `409` (`FRE_IDEMPOTENCY_CAPACITY`, `fre_idempotent_replays_total`)
 - [x] Atomic velocity read-then-write (`snapshot_and_record`): concurrent bursts on one account can't share a stale snapshot (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries)
 - [x] Shared idempotency across replicas: Redis `SET NX` claims with a lease, compare-and-set completion, TTL retention (`FRE_IDEMPOTENCY_BACKEND=redis`, `fre_idempotency_lease_lost_total`)
+- [x] Dependency-aware readiness: `/ready` pings the Redis velocity / idempotency backends and returns `503 not_ready` while one is unreachable (no secrets in the probe body)
 
 ## Acknowledgements
 

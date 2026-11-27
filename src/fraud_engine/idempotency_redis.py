@@ -112,6 +112,10 @@ class RedisIdempotencyStore:
             ) from exc
         return cls(redis.Redis.from_url(url), **kwargs)
 
+    def ping(self) -> None:
+        """Round-trip to Redis; raises if it is unreachable (used by ``/ready``)."""
+        self.client.ping()
+
     def _key(self, transaction_id: str) -> str:
         return f"{self.key_prefix}:{transaction_id}"
 
