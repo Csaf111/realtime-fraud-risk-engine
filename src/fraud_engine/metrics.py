@@ -33,6 +33,12 @@ When the in-memory :class:`~fraud_engine.state.VelocityStore` is attached,
 dropped once their events left the window) show that velocity state stays bounded. The
 Redis backend is not polled here: counting its keys needs a ``SCAN``, which is too expensive
 to run on every scrape (its keys expire through ``ttl_seconds`` instead).
+
+When an idempotency store (:class:`~fraud_engine.idempotency.IdempotencyCache` or the
+shared :class:`~fraud_engine.idempotency_redis.RedisIdempotencyStore`) is attached,
+``fre_idempotent_replays_total`` counts retried ``transaction_id`` requests answered from the
+cache. Replays are *not* re-observed in the decision, score or drift series, so retries
+can't skew them.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from collections.abc import Iterable
 
 from .drift import SCORE_BUCKETS, DriftMonitor
 from .feature_drift import FeatureDriftMonitor
+from .idempotency import IdempotencyBackend
 from .outcomes import OutcomeTracker
 from .state import VelocityStore
 
@@ -58,8 +65,10 @@ class Metrics:
         feature_drift: FeatureDriftMonitor | None = None,
         outcomes: OutcomeTracker | None = None,
         velocity: VelocityStore | None = None,
+        idempotency: IdempotencyBackend | None = None,
     ) -> None:
         self.drift = drift
+        self.idempotency = idempotency
         self.velocity = velocity
         self.outcomes = outcomes
         self.feature_drift = feature_drift
@@ -196,6 +205,8 @@ class Metrics:
         if self.velocity is not None:
             # Read outside the metrics lock: the store has its own lock.
             lines += self._render_velocity(self.velocity)
+        if self.idempotency is not None:
+            lines += self.idempotency.render()
         return "\n".join(lines) + "\n"
 
     @staticmethod

@@ -30,6 +30,9 @@ sequenceDiagram
 
     C->>A: POST /v1/score {transaction}
     A->>A: Pydantic validation (rejects isFraud / unknown fields → 422)
+    opt transaction_id seen before (IdempotencyCache)
+        A-->>C: 200 original result (x-idempotent-replay), or 409 if the payload differs
+    end
     A->>E: score(txn)
     E->>S: snapshot_and_record(nameOrig, nameDest, step, amount)
     Note right of S: Atomic: snapshot of events BEFORE this one,<br/>then record it
@@ -136,7 +139,8 @@ flowchart LR
 |---|---|---|
 | Velocity state | In-process deques by default (idle account keys evicted once every event has left the window, so memory tracks active accounts, not all accounts ever seen; parity-tested against a non-evicting store); `FRE_VELOCITY_BACKEND=redis` shares Redis sorted sets keyed by account (same interface, parity-tested) | Snapshot+record is atomic (lock / `WATCH`-`MULTI`); per-account partitioning still needed for a defined order *within* a step |
 | Model | JSON coefficients, pure-Python inference (~µs) | Gradient-boosted trees + TreeSHAP (`--model gbt`); rules as a hard floor via `FRE_RULES_FLOOR` |
-| Throughput | Single uvicorn worker | Horizontal replicas behind a load balancer with the Redis velocity backend |
+| Retries | Idempotent per `transaction_id`: bounded in-memory replay cache per replica (`FRE_IDEMPOTENCY_CAPACITY`), or shared across replicas with `FRE_IDEMPOTENCY_BACKEND=redis` (`SET NX` lease claims, compare-and-set completion, TTL retention), so a retry landing on any replica replays instead of re-recording velocity | Idempotency for the Kafka consumer path (today sinks must dedupe on `transaction_id`) |
+| Throughput | Single uvicorn worker; `/ready` returns `503` while a configured Redis backend is unreachable, so a load balancer drains that replica | Horizontal replicas behind a load balancer with the Redis velocity backend |
 | Ingestion | Synchronous HTTP; `fraud_engine.stream` consumes a Kafka topic and produces results/dead letters back to topics (at-least-once), with consumer-group rebalance hooks and textfile metrics | Per-partition watermarks; consumer lag in the metrics file |
 | Feedback | `POST /v1/labels` joins labels to served decisions; optional JSONL feedback log of served features + labels; `train --feedback` retrains a candidate for shadow deployment; `fraud_engine.promote` gates candidate vs live on the unseen labelled tail | Scheduled retrain + gate in CI |
 | Monitoring | Counters, latency and score histograms, per-rule hits, rolling score PSI and per-feature PSI vs training references | Delayed-label precision/recall |

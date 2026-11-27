@@ -76,14 +76,43 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 | `POST` | `/v1/labels` | Report delayed fraud labels for scored transactions (monitoring only) |
 | `GET` | `/v1/rules` | The rulebook (code, description, points) |
 | `GET` | `/health` | Liveness |
-| `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version |
+| `GET` | `/ready` | Readiness + mode (`rules-only` / `rules+model`) + model version; pings Redis backends and returns `503` if one is unreachable |
 | `GET` | `/metrics` | Prometheus-format counters, latency histogram, per-rule hits, score histogram |
 
 Every response carries an `x-request-id` header. The API echoes yours or generates one.
 
+`/health` is liveness only (the process is up). `/ready` is the probe to route traffic on:
+when `FRE_VELOCITY_BACKEND=redis` or `FRE_IDEMPOTENCY_BACKEND=redis`, it pings each Redis
+backend on every call, reports `"dependencies": {"velocity_store": "ok", ...}`, and answers
+`503` with `"status": "not_ready"` while any of them is unreachable, so a load balancer stops
+sending a replica requests it would fail. It recovers on its own once Redis is back. Failures
+are reported as `error: <ExceptionType>` only; the full error (which may include the Redis
+host) goes to the log, never to the response.
+
 Request bodies are capped at `FRE_MAX_BODY_BYTES` (2 MiB by default) **before** any JSON is
 parsed, so an oversized payload is refused with `413` without being buffered or decoded,
 including chunked uploads without a `Content-Length`.
+
+Scoring is **idempotent per `transaction_id`**. Retrying a request with the same id and the
+same payload returns the original result (with an `x-idempotent-replay: true` header) and
+does not record the transaction in velocity state again, so a client or gateway retry can't
+inflate its own account's velocity or get a harsher decision the second time. The same id
+with a *different* payload is rejected with `409`; a duplicate that arrives while the first
+is still being scored waits for it (or gets `503` + `Retry-After` after 5 s). The batch
+endpoint applies the same rule to every transaction it records, rejects a batch that
+reuses one id for different payloads before scoring any of it, and what-if batches
+(`update_state: false`) bypass the cache. The last `FRE_IDEMPOTENCY_CAPACITY` ids are kept
+per replica; requests without a `transaction_id` are always scored.
+
+With several replicas behind a load balancer, a retry often lands on a *different* replica.
+Set `FRE_IDEMPOTENCY_BACKEND=redis` (same `redis` extra and `FRE_REDIS_URL` as the velocity
+backend) to share claims and results across replicas: exactly one request cluster-wide wins
+`SET NX` on `<FRE_IDEMPOTENCY_KEY_PREFIX>:<transaction_id>` and scores the id, every other
+replica replays its result (or gets `409` / waits, as above). A claim is a 30 s lease, so a
+replica that dies mid-request can't wedge an id; completing or releasing is compare-and-set
+on the claim token, so a stale claimant never overwrites a newer one
+(`fre_idempotency_lease_lost_total`). Results are kept for `FRE_IDEMPOTENCY_TTL_SECONDS`
+(default 24 h) instead of the capacity bound.
 
 ### Monitoring metrics
 
@@ -100,6 +129,10 @@ including chunked uploads without a `Content-Length`.
 | `fre_feature_drift_window_count` | gauge | Feature vectors currently in the feature drift window |
 | `fre_velocity_keys` | gauge | Account keys held by the in-memory velocity store (bounded by accounts active in the last `FRE_VELOCITY_WINDOW_STEPS`) |
 | `fre_velocity_evicted_keys_total` | counter | Idle velocity keys evicted once all their events left the window (in-memory backend only) |
+| `fre_idempotent_replays_total` | counter | Retried `transaction_id`s answered from the idempotency cache (not re-scored or re-observed) |
+| `fre_idempotency_conflicts_total` | counter | `transaction_id`s reused with a different payload (`409`) |
+| `fre_idempotency_keys`, `fre_idempotency_evicted_total` | gauge / counter | Ids held for replay; oldest ids evicted at `FRE_IDEMPOTENCY_CAPACITY` (in-memory backend only) |
+| `fre_idempotency_lease_lost_total` | counter | Redis backend: claims whose lease expired and was taken over before the result was stored |
 | `fre_feature_drift_skipped_total` | counter | Feature vectors skipped because a value was non-finite |
 | `fre_shadow_scored_total`, `fre_shadow_errors_total` | counter | Shadow model successes / failures (only with `FRE_SHADOW_MODEL_PATH`) |
 | `fre_shadow_decisions_total{decision}` | counter | Decisions the shadow model *would* have made |
@@ -502,6 +535,7 @@ make lint typecheck
 | `test_features.py` | Every feature, ordering contract, edge cases |
 | `test_state.py` | Window maths, no self/future visibility, caps |
 | `test_state_redis.py` | Redis backend (fakeredis): same window semantics, parity with in-memory, shared state across replicas, namespacing |
+| `test_idempotency_redis.py` | Shared idempotency (fakeredis): cross-replica replay and `409`, waiting duplicates, lease expiry/takeover, TTL, two API replicas recording velocity once |
 | `test_rules.py` | Each rule, capping, ordering, configurable thresholds |
 | `test_model.py` | Contributions sum to the logit, persistence, schema guards |
 | `test_trees.py` | Gradient-boosted trees: TreeSHAP equals brute-force Shapley values, additivity, scikit-learn export parity, artifact validation, loader dispatch, serving + shadowing |
@@ -574,6 +608,10 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_LABEL_PENDING_CAPACITY` | `100000` | Served decisions kept awaiting a delayed label (`0` disables `/v1/labels`) |
 | `FRE_LABEL_WINDOW` | `5000` | Labelled outcomes in the rolling precision/recall window |
 | `FRE_FEEDBACK_LOG_PATH` | unset | JSONL file of served features joined to delayed labels, for retraining |
+| `FRE_IDEMPOTENCY_CAPACITY` | `100000` | Recent `transaction_id` results kept so retries replay the original decision (`0` disables, for either backend) |
+| `FRE_IDEMPOTENCY_BACKEND` | `memory` | `memory` (per replica) or `redis` (shared across replicas via `FRE_REDIS_URL`; needs the `redis` extra) |
+| `FRE_IDEMPOTENCY_TTL_SECONDS` | `86400` | How long the `redis` backend keeps a completed result for replay |
+| `FRE_IDEMPOTENCY_KEY_PREFIX` | `fre:idempotency` | Namespace for idempotency keys in Redis (must differ from `FRE_REDIS_KEY_PREFIX`) |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -586,6 +624,8 @@ are in [docs/cicd.md](docs/cicd.md).
 │   ├── features.py        Shared online/offline feature code
 │   ├── state.py           Point-in-time VelocityStore + backend factory
 │   ├── state_redis.py     Redis-backed VelocityStore (optional extra)
+│   ├── idempotency.py     Per-transaction_id replay cache + backend factory
+│   ├── idempotency_redis.py  Shared Redis idempotency store (optional extra)
 │   ├── rules.py           Rulebook R001–R008
 │   ├── model.py           Pure-Python logistic baseline + exact explanations
 │   ├── trees.py           Pure-Python gradient-boosted trees + exact TreeSHAP
@@ -627,7 +667,10 @@ are in [docs/cicd.md](docs/cicd.md).
   - [x] Promotion gate: candidate vs live on the unseen, labelled tail of the feedback log (`python -m fraud_engine.promote`, exit code = verdict)
 - [x] Request body size limit enforced before JSON parsing (`FRE_MAX_BODY_BYTES`, `413` / `400`)
 - [x] Bounded in-memory velocity state: idle account keys evicted once outside the window, snapshot-exact (`fre_velocity_keys`, `fre_velocity_evicted_keys_total`)
+- [x] Idempotent scoring per `transaction_id`: retries replay the original result without re-recording velocity; reused id + different payload → `409` (`FRE_IDEMPOTENCY_CAPACITY`, `fre_idempotent_replays_total`)
 - [x] Atomic velocity read-then-write (`snapshot_and_record`): concurrent bursts on one account can't share a stale snapshot (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries)
+- [x] Shared idempotency across replicas: Redis `SET NX` claims with a lease, compare-and-set completion, TTL retention (`FRE_IDEMPOTENCY_BACKEND=redis`, `fre_idempotency_lease_lost_total`)
+- [x] Dependency-aware readiness: `/ready` pings the Redis velocity / idempotency backends and returns `503 not_ready` while one is unreachable (no secrets in the probe body)
 
 ## Acknowledgements
 
