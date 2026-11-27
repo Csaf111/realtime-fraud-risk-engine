@@ -13,7 +13,7 @@ Assign an incident commander, engineering owner and decision/risk owner before a
 ## Triage
 
 1. Identify environment, image digest, commit SHA, model version, threshold settings and time of onset.
-2. Check `/health` and `/ready`, application logs and `/metrics` (latency, decision mix, rule hits and score distribution).
+2. Check `/health` and `/ready` (a `503` with `dependencies.<store>: error: ...` means that replica cannot reach Redis), application logs and `/metrics` (latency, decision mix, rule hits and score distribution).
 3. Compare recent deployment, configuration and upstream payment event changes. Do **not** paste raw account identifiers or transaction bodies into tickets.
 4. For elevated BLOCK rates, suspend automated enforcement using an approved payment-operations contingency; **do not silently change thresholds**.
 5. If a model artifact is suspected, quarantine it, preserve its digest and redeploy the last verified artifact.

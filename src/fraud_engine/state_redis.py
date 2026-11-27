@@ -107,6 +107,10 @@ class RedisVelocityStore:
             ) from exc
         return cls(redis.Redis.from_url(url), **kwargs)
 
+    def ping(self) -> None:
+        """Round-trip to Redis; raises if it is unreachable (used by ``/ready``)."""
+        self.client.ping()
+
     def _orig_key(self, name: str) -> str:
         return f"{self.key_prefix}:orig:{name}"
 

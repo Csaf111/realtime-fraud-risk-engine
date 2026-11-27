@@ -8,9 +8,10 @@ from __future__ import annotations
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Protocol, runtime_checkable
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
 from .config import Settings
@@ -118,6 +119,36 @@ def _check_batch_ids(transactions: list[Transaction]) -> None:
             )
 
 
+@runtime_checkable
+class _Pingable(Protocol):
+    def ping(self) -> None: ...
+
+
+def _check_dependencies(app: FastAPI) -> dict[str, str]:
+    """Ping every shared backend (Redis velocity / idempotency store) the replica needs.
+
+    In-process backends have nothing to ping and are omitted. A failed ping is reported as
+    ``"error: <ExceptionType>"`` only: the exception text (which can carry hostnames or
+    credentials from the Redis URL) goes to the log, never to the probe response.
+    """
+    backends: dict[str, Any] = {
+        "velocity_store": app.state.engine.store,
+        "idempotency_store": app.state.idempotency,
+    }
+    checks: dict[str, str] = {}
+    for name, backend in backends.items():
+        if not isinstance(backend, _Pingable):
+            continue
+        try:
+            backend.ping()
+        except Exception as exc:
+            log.warning("Readiness check failed for %s: %r", name, exc)
+            checks[name] = f"error: {type(exc).__name__}"
+        else:
+            checks[name] = "ok"
+    return checks
+
+
 def _drift_monitor(settings: Settings) -> DriftMonitor | None:
     if not settings.score_reference_path:
         return None
@@ -187,12 +218,20 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
         """Liveness: the process is up."""
         return {"status": "ok", "version": __version__}
 
-    @app.get("/ready", tags=["ops"])
-    def ready(request: Request) -> dict[str, str]:
-        """Readiness: the engine (and model, if configured) is loaded."""
+    @app.get(
+        "/ready",
+        tags=["ops"],
+        responses={503: {"description": "A shared backend (e.g. Redis) is unreachable"}},
+    )
+    def ready(request: Request) -> Any:
+        """Readiness: the engine (and model, if configured) is loaded and every shared
+        backend answers a ping. Returns ``503`` with ``status: not_ready`` otherwise, so a
+        load balancer stops routing to a replica that would fail every scoring request."""
         eng: RiskEngine = request.app.state.engine
-        body = {
-            "status": "ready",
+        checks = _check_dependencies(request.app)
+        healthy = all(v == "ok" for v in checks.values())
+        body: dict[str, Any] = {
+            "status": "ready" if healthy else "not_ready",
             "mode": eng.mode,
             "model_version": eng.model_version,
             "environment": settings.environment,
@@ -201,8 +240,12 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
                 "loaded" if request.app.state.metrics.feature_drift else "none"
             ),
         }
+        if checks:
+            body["dependencies"] = checks
         if eng.shadow_model_version is not None:
             body["shadow_model_version"] = eng.shadow_model_version
+        if not healthy:
+            return JSONResponse(status_code=503, content=body)
         return body
 
     @app.post("/v1/score", response_model=RiskResult, tags=["scoring"])
