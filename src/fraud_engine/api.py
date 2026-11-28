@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from . import __version__
+from .auth import ApiKeyAuth, ApiKeyMiddleware
 from .config import Settings
 from .drift import DriftMonitor, ScoreReference
 from .feature_drift import FeatureDriftMonitor, FeatureReference
@@ -165,6 +166,7 @@ def _feature_drift_monitor(settings: Settings) -> FeatureDriftMonitor | None:
 
 def create_app(settings: Settings | None = None, engine: RiskEngine | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
+    auth = ApiKeyAuth(settings.api_keys, settings.label_api_keys)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -186,7 +188,15 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
             ),
             velocity=store if isinstance(store, VelocityStore) else None,
             idempotency=app.state.idempotency,
+            auth=auth,
         )
+        if auth.open_scopes and settings.environment in ("staging", "production"):
+            log.warning(
+                "API-key authentication is OFF for scope(s) %s in %s: set FRE_API_KEYS "
+                "(and FRE_LABEL_API_KEYS) or enforce authentication at the gateway",
+                ",".join(auth.open_scopes),
+                settings.environment,
+            )
         log.info(
             "Engine ready: mode=%s version=%s env=%s",
             app.state.engine.mode,
@@ -205,6 +215,9 @@ def create_app(settings: Settings | None = None, engine: RiskEngine | None = Non
     # Added before the request-id middleware so it sits *inside* it: 413/400 responses
     # from the size limit still carry an x-request-id.
     app.add_middleware(BodySizeLimitMiddleware, max_body_bytes=settings.max_body_bytes)
+    # Outside the size limit (an unauthenticated client gets 401 before any body handling)
+    # and inside the request-id middleware (the 401 still carries an x-request-id).
+    app.add_middleware(ApiKeyMiddleware, auth=auth)
 
     @app.middleware("http")
     async def request_id(request: Request, call_next):
