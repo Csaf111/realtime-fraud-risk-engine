@@ -139,11 +139,15 @@ jobs:
         with:
           name: synthetic-model
           path: ci-model
-      - name: Smoke test (rules + model)
+      - name: Smoke test (rules + model, API-key auth)
+        env:
+          # Throwaway key for this job's container only; not a secret.
+          FRE_SMOKE_API_KEY: ci-smoke-key-0123456789abcdef
         run: |
           docker run -d --name fre-model -p 8001:8000 \
             -v "$PWD/ci-model:/app/models:ro" \
             -e FRE_MODEL_PATH=/app/models/baseline.json \
+            -e FRE_API_KEYS="${FRE_SMOKE_API_KEY}" \
             realtime-fraud-risk-engine:ci
           ./scripts/smoke_test.sh http://localhost:8001
           curl -fsS http://localhost:8001/ready | grep -q '"rules+model"'

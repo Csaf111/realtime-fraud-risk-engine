@@ -39,6 +39,10 @@ shared :class:`~fraud_engine.idempotency_redis.RedisIdempotencyStore`) is attach
 ``fre_idempotent_replays_total`` counts retried ``transaction_id`` requests answered from the
 cache. Replays are *not* re-observed in the decision, score or drift series, so retries
 can't skew them.
+
+When API-key authentication is enabled (``FRE_API_KEYS`` / ``FRE_LABEL_API_KEYS``),
+``fre_auth_failures_total{scope, reason}`` counts rejected ``/v1`` requests. Keys are never
+exported.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ import threading
 from collections import Counter
 from collections.abc import Iterable
 
+from .auth import ApiKeyAuth
 from .drift import SCORE_BUCKETS, DriftMonitor
 from .feature_drift import FeatureDriftMonitor
 from .idempotency import IdempotencyBackend
@@ -66,8 +71,10 @@ class Metrics:
         outcomes: OutcomeTracker | None = None,
         velocity: VelocityStore | None = None,
         idempotency: IdempotencyBackend | None = None,
+        auth: ApiKeyAuth | None = None,
     ) -> None:
         self.drift = drift
+        self.auth = auth
         self.idempotency = idempotency
         self.velocity = velocity
         self.outcomes = outcomes
@@ -207,6 +214,8 @@ class Metrics:
             lines += self._render_velocity(self.velocity)
         if self.idempotency is not None:
             lines += self.idempotency.render()
+        if self.auth is not None and self.auth.any_enabled:
+            lines += self.auth.render()
         return "\n".join(lines) + "\n"
 
     @staticmethod

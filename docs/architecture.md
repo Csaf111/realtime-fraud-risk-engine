@@ -29,6 +29,9 @@ sequenceDiagram
     participant M as Model (optional)
 
     C->>A: POST /v1/score {transaction}
+    opt FRE_API_KEYS set
+        A-->>C: 401 if the API key is missing / invalid (before the body is read)
+    end
     A->>A: Pydantic validation (rejects isFraud / unknown fields → 422)
     opt transaction_id seen before (IdempotencyCache)
         A-->>C: 200 original result (x-idempotent-replay), or 409 if the payload differs
