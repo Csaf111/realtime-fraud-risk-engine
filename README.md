@@ -81,6 +81,25 @@ Interactive docs live at `/docs` (Swagger) and `/redoc`.
 
 Every response carries an `x-request-id` header. The API echoes yours or generates one.
 
+**API-key authentication (optional).** Set `FRE_API_KEYS` (comma-separated, so keys can be
+rotated with an overlap) and every `/v1/*` path requires `Authorization: Bearer <key>` or
+`x-api-key: <key>`; unknown `/v1` paths are denied too. `POST /v1/labels` has its own scope:
+set `FRE_LABEL_API_KEYS` so a payment client that can score cannot also post fraud labels
+(which would poison the `fre_label_*` metrics and the retraining feedback log); unset, it
+falls back to `FRE_API_KEYS`. The check runs in an ASGI middleware **before** the body is
+read, so an unauthenticated caller gets `401` + `WWW-Authenticate` without costing any
+parsing or seeing a `422` schema error. Keys must be 16-256 printable ASCII characters, are
+held only as SHA-256 digests, compared in constant time, and never logged or exported
+(failures: `fre_auth_failures_total{scope, reason}`). `/health`, `/ready`, `/metrics` and
+the docs stay open for probes and scrapers. With no keys set the API is open, as before, and
+a `staging` / `production` replica logs a warning for every open scope.
+
+```bash
+export FRE_API_KEYS="$(openssl rand -hex 24)"
+curl -s -X POST localhost:8000/v1/score -H "x-api-key: $FRE_API_KEYS" \
+  -H 'content-type: application/json' -d @scripts/sample_benign.json
+```
+
 `/health` is liveness only (the process is up). `/ready` is the probe to route traffic on:
 when `FRE_VELOCITY_BACKEND=redis` or `FRE_IDEMPOTENCY_BACKEND=redis`, it pings each Redis
 backend on every call, reports `"dependencies": {"velocity_store": "ok", ...}`, and answers
@@ -612,6 +631,8 @@ are in [docs/cicd.md](docs/cicd.md).
 | `FRE_IDEMPOTENCY_BACKEND` | `memory` | `memory` (per replica) or `redis` (shared across replicas via `FRE_REDIS_URL`; needs the `redis` extra) |
 | `FRE_IDEMPOTENCY_TTL_SECONDS` | `86400` | How long the `redis` backend keeps a completed result for replay |
 | `FRE_IDEMPOTENCY_KEY_PREFIX` | `fre:idempotency` | Namespace for idempotency keys in Redis (must differ from `FRE_REDIS_KEY_PREFIX`) |
+| `FRE_API_KEYS` | unset | Comma-separated API keys required on `/v1/*` (Bearer or `x-api-key`; 16-256 chars). Unset leaves scoring open |
+| `FRE_LABEL_API_KEYS` | unset | Separate keys for `POST /v1/labels`; unset falls back to `FRE_API_KEYS` |
 | `PORT` | `8000` | Container listen port |
 
 ## Project layout
@@ -620,6 +641,7 @@ are in [docs/cicd.md](docs/cicd.md).
 .
 ├── src/fraud_engine/
 │   ├── api.py             FastAPI app (create_app factory)
+│   ├── auth.py            Optional API-key auth middleware (score / labels scopes)
 │   ├── scoring.py         RiskEngine: features → rules → model → decision
 │   ├── features.py        Shared online/offline feature code
 │   ├── state.py           Point-in-time VelocityStore + backend factory
@@ -671,6 +693,7 @@ are in [docs/cicd.md](docs/cicd.md).
 - [x] Atomic velocity read-then-write (`snapshot_and_record`): concurrent bursts on one account can't share a stale snapshot (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries)
 - [x] Shared idempotency across replicas: Redis `SET NX` claims with a lease, compare-and-set completion, TTL retention (`FRE_IDEMPOTENCY_BACKEND=redis`, `fre_idempotency_lease_lost_total`)
 - [x] Dependency-aware readiness: `/ready` pings the Redis velocity / idempotency backends and returns `503 not_ready` while one is unreachable (no secrets in the probe body)
+- [x] Optional API-key authentication before body parsing, with a separate scope for delayed labels (`FRE_API_KEYS`, `FRE_LABEL_API_KEYS`, `fre_auth_failures_total`)
 
 ## Acknowledgements
 

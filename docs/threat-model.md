@@ -27,10 +27,11 @@ flowchart LR
 
 | Threat | Current posture | Required production control |
 |---|---|---|
-| Unauthenticated high-volume scoring or scraping | No built-in authentication or rate limiting; request bodies capped at `FRE_MAX_BODY_BYTES` before JSON parsing (`413`), batches at `FRE_MAX_BATCH_SIZE` | Gateway authentication, quotas, edge request-size limits and abuse monitoring |
+| Unauthenticated high-volume scoring or scraping | Optional built-in API keys on `/v1/*` (`FRE_API_KEYS`), checked before the body is read (`401`), failures in `fre_auth_failures_total`; no rate limiting; request bodies capped at `FRE_MAX_BODY_BYTES` before JSON parsing (`413`), batches at `FRE_MAX_BATCH_SIZE` | Gateway authentication, quotas, edge request-size limits and abuse monitoring |
 | Transaction replay or duplicate events corrupt velocity counts | No durable idempotency contract | Authenticated idempotency key, bounded retention, deduplication and replay tests |
 | Concurrent requests race on velocity state | Mitigated: snapshot and record are one atomic step (in-memory lock; Redis `WATCH`/`MULTI` with bounded retries), so a parallel burst can't share a stale count | Same-step events remain unordered and retries are not idempotent; partition by account and add idempotency keys |
 | Post-authorisation information contaminates a decision | v1 rules/features reference post-transaction balances | Versioned pre-authorisation request contract, new feature schema and retraining; do not use v1 for payment authorisation |
+| Label poisoning via `POST /v1/labels` (fake outcomes skew `fre_label_*` and the retraining feedback log) | Separate label scope (`FRE_LABEL_API_KEYS`): scoring keys cannot post labels and label keys cannot score | Issue label keys only to the case-management / chargeback job; review the feedback log before `train --feedback` |
 | Malformed/poisoned training data | Data ingestion validation is being improved | Schema checks, finite-number checks, provenance, immutable datasets and reproducible splits |
 | Compromised model artifact | Local artifact load; validation proposals exist | Digest/signature verification, trusted storage, review/approval and rollback |
 | Sensitive data leaks into logs or metrics | Metrics should avoid high-cardinality account labels | Redaction tests, access controls, retention policies and no payload logging |

@@ -110,6 +110,9 @@ jobs:
             -d "{\"image\":\"${IMAGE_REF}\",\"environment\":\"${{ github.ref_name }}\",\"sha\":\"${GITHUB_SHA}\"}"
       - name: Post-deploy smoke test
         if: env.APP_URL != ''
+        env:
+          # Set the SMOKE_API_KEY secret on the environment once it runs with FRE_API_KEYS.
+          FRE_SMOKE_API_KEY: ${{ secrets.SMOKE_API_KEY }}
         run: ./scripts/smoke_test.sh "${APP_URL}"
 
   release:

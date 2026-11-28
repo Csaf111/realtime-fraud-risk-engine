@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .auth import parse_keys, validate_keys
 from .limits import DEFAULT_MAX_BODY_BYTES, MIN_MAX_BODY_BYTES
 
 
@@ -73,6 +74,10 @@ class Settings:
             another replica also replays; requires the ``redis`` extra).
         idempotency_ttl_seconds: how long the ``redis`` backend keeps a completed result.
         idempotency_key_prefix: namespace for idempotency keys in Redis.
+        api_keys: keys accepted on the ``/v1/*`` scoring endpoints (see
+            :mod:`fraud_engine.auth`). Empty (default) leaves them unauthenticated.
+        label_api_keys: keys accepted on ``POST /v1/labels``. Empty falls back to
+            ``api_keys``. Both are excluded from ``repr`` so they never reach a log.
     """
 
     review_threshold: float = 0.5
@@ -100,6 +105,8 @@ class Settings:
     idempotency_backend: str = "memory"
     idempotency_ttl_seconds: int = 86_400
     idempotency_key_prefix: str = "fre:idempotency"
+    api_keys: tuple[str, ...] = field(default=(), repr=False)
+    label_api_keys: tuple[str, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.review_threshold <= self.block_threshold <= 1.0:
@@ -142,6 +149,8 @@ class Settings:
             and self.idempotency_key_prefix == self.redis_key_prefix
         ):
             raise ValueError("idempotency_key_prefix must differ from redis_key_prefix")
+        validate_keys("api_keys", self.api_keys)
+        validate_keys("label_api_keys", self.label_api_keys)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -171,4 +180,6 @@ class Settings:
             idempotency_backend=(os.getenv("FRE_IDEMPOTENCY_BACKEND") or "memory").strip().lower(),
             idempotency_ttl_seconds=_int("FRE_IDEMPOTENCY_TTL_SECONDS", 86_400),
             idempotency_key_prefix=os.getenv("FRE_IDEMPOTENCY_KEY_PREFIX") or "fre:idempotency",
+            api_keys=parse_keys(os.getenv("FRE_API_KEYS")),
+            label_api_keys=parse_keys(os.getenv("FRE_LABEL_API_KEYS")),
         )
